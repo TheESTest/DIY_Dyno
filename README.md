@@ -6,7 +6,7 @@ a stepper-actuated hydraulic brake.
 
 | Component | Version | Location |
 |---|---|---|
-| Raspberry Pi UI | 1.4.0 | [`pi_gui/`](pi_gui/) |
+| Raspberry Pi UI | 1.5.0 | [`pi_gui/`](pi_gui/) |
 | ESP32-S3 firmware | 1.4.0 | [`esp32_firmware/`](esp32_firmware/) |
 
 Both versions are recorded in the `_conditions.json` file saved beside every
@@ -95,6 +95,21 @@ sweep. A brake that is already fully applied looks identical to a stalled motor
 from here, so this reports a suspicion, not a verdict: the point at which the
 sweep stopped being trustworthy is marked on the plot, written to the CSV as
 `Stall_Suspected`, and recorded in the run's conditions file.
+
+## Updating a rig from here
+
+The interface can pull its own code from this repository. It fetches to memory,
+**compiles every Python file before allowing it to replace anything**, copies
+what it replaces into a dated `backup_` folder, and writes through a temporary
+name so an interrupted write cannot leave a half-file where the real one was. It
+refuses while a run, a characterisation sweep or a replay is going, or while the
+controller is in any state but idle.
+
+Firmware is **downloaded only**. Flashing is a separate button that requires the
+serial port to be disconnected and a deliberate confirmation, because it reboots
+the controller holding the brake. `esp32_firmware/build/firmware.bin` is the
+binary it fetches; rebuild and commit it alongside `main.cpp` so the two never
+disagree.
 
 ## Running it
 

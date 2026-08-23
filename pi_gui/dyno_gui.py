@@ -30,6 +30,10 @@ import threading
 import time
 import csv
 import os
+import re
+import shutil
+import subprocess
+import urllib.request
 
 import numpy as np
 import serial
@@ -144,13 +148,32 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.4.0"
+UI_VERSION = "1.5.0"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at
 # runtime just to draw a logo.
 LOGO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "centurial_logo.png")
+
+# Updating from the repository. Files are fetched to a staging directory,
+# checked, and only then moved into place - never downloaded over the code
+# that is running, because a truncated download would leave the machine that
+# drives the brake unable to start.
+UPDATE_REPO = "TheESTest/DIY_Dyno"
+UPDATE_BRANCH = "main"
+UPDATE_RAW = "https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+UPDATE_TIMEOUT_S = 30
+
+# (path in the repository, filename on this machine). Tests come too: they
+# are how the operator can check an update before trusting it.
+UPDATE_PY_FILES = [
+    ("pi_gui/dyno_gui.py", "dyno_gui.py"),
+    ("pi_gui/dyno_dsp.py", "dyno_dsp.py"),
+]
+UPDATE_ASSET_FILES = [("pi_gui/centurial_logo.png", "centurial_logo.png")]
+UPDATE_FW_PATH = "esp32_firmware/build/firmware.bin"
+UPDATE_FW_SRC = "esp32_firmware/src/main.cpp"
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dyno_runs")
 
@@ -250,6 +273,12 @@ class DynoApp:
         # firmware old enough not to report one leaves it that way.
         self.fw_version = "unknown"
         self.fw_build = ""
+        # Free-text notes for the run in progress. Deliberately not part of
+        # the settings: a profile describes the rig, a note describes one
+        # test, and a note restored from a saved profile would be a lie
+        # about a run it was never written for.
+        self._notes_edited = None
+        self._run_started = None       # when the current recording began
 
         # Readiness flags (from ESP). "sim" starts True so an unknown board is
         # treated as suspect until it tells us otherwise — the safe default is
@@ -629,9 +658,10 @@ class DynoApp:
                   foreground="gray").pack(side=tk.LEFT, padx=8)
         self._refresh_motor_ports()
 
-        # Event log along the bottom — packed first so it keeps its height when
-        # the plot above it expands.
+        # Notes and the event log along the bottom — packed first so they keep
+        # their height when the plot above them expands.
         self._build_event_log(parent)
+        self._build_notes(parent)
 
         # Body: controls (left), plot (center), status (right)
         body = ttk.Frame(parent)
@@ -639,6 +669,70 @@ class DynoApp:
         self._build_controls(body)
         self._build_status(body)
         self._build_plot(body)
+
+    # ── Test notes ───────────────────────────────────────────
+    def _build_notes(self, parent):
+        """Free text saved beside whatever run is recorded next.
+
+        Kept on the Live Run tab rather than in the settings, because it is
+        written while watching the engine, not while setting the rig up.
+        """
+        lf = ttk.LabelFrame(parent, text="Test Notes")
+        lf.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(2, 2))
+
+        inner = ttk.Frame(lf)
+        inner.pack(fill=tk.X, padx=4, pady=3)
+        self.notes_text = tk.Text(inner, height=3, wrap=tk.WORD,
+                                  font=("TkDefaultFont", 9))
+        self.notes_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        sb = ttk.Scrollbar(inner, orient=tk.VERTICAL,
+                           command=self.notes_text.yview)
+        sb.pack(side=tk.LEFT, fill=tk.Y)
+        self.notes_text.configure(yscrollcommand=sb.set)
+        self.notes_text.bind("<KeyRelease>", self._on_notes_edited)
+
+        side = ttk.Frame(inner)
+        side.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0))
+        ttk.Button(side, text="Clear", width=8,
+                   command=self._clear_notes).pack(anchor=tk.N)
+        self.notes_status = ttk.Label(side, text="", foreground="gray",
+                                      wraplength=150, justify=tk.LEFT)
+        self.notes_status.pack(anchor=tk.W, pady=(4, 0))
+        self._update_notes_status()
+
+    def _on_notes_edited(self, _event=None):
+        self._notes_edited = time.time()
+        self._update_notes_status()
+
+    def _update_notes_status(self):
+        n = len(self._get_notes())
+        if not n:
+            self.notes_status.config(
+                text="Saved with the next run.", foreground="gray")
+            return
+        # Say plainly when the text predates the run being recorded, so a note
+        # left over from the previous pull is not mistaken for this one.
+        stale = (self.recording and self._notes_edited is not None
+                 and self._run_started is not None
+                 and self._notes_edited < self._run_started)
+        self.notes_status.config(
+            text=(f"{n} chars — written before this run started"
+                  if stale else f"{n} chars, saved with the run"),
+            foreground=("#B9770E" if stale else "gray"))
+
+    def _get_notes(self):
+        try:
+            return self.notes_text.get("1.0", tk.END).strip()
+        except (AttributeError, tk.TclError):
+            return ""
+
+    def _clear_notes(self):
+        if self._get_notes() and not messagebox.askyesno(
+                "Clear notes?", "Discard the notes typed for this test?"):
+            return
+        self.notes_text.delete("1.0", tk.END)
+        self._notes_edited = None
+        self._update_notes_status()
 
     # ── Event log ────────────────────────────────────────────
     def _build_event_log(self, parent):
@@ -1528,16 +1622,26 @@ class DynoApp:
         self.fw_version_label.pack(side=tk.LEFT)
         self.fw_build_label = ttk.Label(frow, text="", foreground="gray")
         self.fw_build_label.pack(side=tk.LEFT, padx=6)
+        urow = ttk.Frame(sf)
+        urow.pack(fill=tk.X, padx=4, pady=(4, 2))
         self.update_btn = ttk.Button(
-            sf, text="Update from GitHub", width=22,
-            state=tk.DISABLED, command=self._update_from_github)
-        self.update_btn.pack(anchor=tk.W, padx=4, pady=(4, 2))
+            urow, text="Update from GitHub", width=22,
+            command=self._update_from_github)
+        self.update_btn.pack(side=tk.LEFT)
+        self.flash_btn = ttk.Button(
+            urow, text="Flash downloaded firmware", width=24,
+            command=self._flash_downloaded_firmware)
+        self.flash_btn.pack(side=tk.LEFT, padx=6)
+        self.update_status = ttk.Label(sf, text="", foreground="gray")
+        self.update_status.pack(anchor=tk.W, padx=4)
         ttk.Label(sf, wraplength=380, justify=tk.LEFT, foreground="gray",
-                  text=("Not wired up yet. It will fetch the current interface "
-                        "and firmware from github.com/TheESTest/DIY_Dyno, keep "
-                        "a copy of what is running now, and offer to flash the "
-                        "board - none of which should happen mid-session, so it "
-                        "will refuse while a run is recording.")
+                  text=(f"Fetches the interface and firmware from "
+                        f"github.com/{UPDATE_REPO}. Downloaded code is compiled "
+                        "before it is allowed to replace anything, and the "
+                        "files it replaces are kept in a dated backup folder "
+                        "alongside. Refuses while a run, sweep or replay is "
+                        "going. Firmware is only downloaded - flashing is a "
+                        "separate step and needs the port disconnected.")
                   ).pack(anchor=tk.W, padx=4, pady=(0, 4))
         ttk.Label(pf, wraplength=380, justify=tk.LEFT, foreground="gray",
                   text=("Settings are remembered between sessions automatically - "
@@ -2004,6 +2108,20 @@ class DynoApp:
                     f"min ({lo:g})")
         except ValueError:
             pass
+        # Mirrors the controller's own rule. Without this the send is only
+        # rejected once it reaches the board, which is how a stale minimum
+        # survived a drivetrain change unnoticed.
+        try:
+            bmin = float(self.cfg_vars["brake_min"].get())
+            bmax = float(self.cfg_vars["brake_max"].get())
+            if bmin < 0:
+                problems.append(f"Brake range min: {bmin:g} cannot be negative")
+            elif bmin >= bmax:
+                problems.append(
+                    f"Brake range: min ({bmin:g}) must be below max ({bmax:g})"
+                    " - check it after changing the drivetrain, since both are step positions")
+        except ValueError:
+            problems.append("Brake range: min and max must be numbers")
         if self.cfg_vars["rpm_median"].get().strip() not in ("1", "3", "5", "7"):
             problems.append("Median window: must be 1, 3, 5 or 7")
         try:
@@ -2166,7 +2284,11 @@ class DynoApp:
                         store[k].set(f"{float(store[k].get()) * factor:.6g}")
                     except (KeyError, ValueError):
                         pass
-            for k in ("step_speed", "step_accel"):
+            # brake_min is a step position, so it moves with the scale exactly
+            # as the travel does. Left behind, a min set for the old geometry
+            # can end up at or above the new max, which the controller refuses
+            # outright with "BRAKE_RANGE needs 0 <= min < max".
+            for k in ("step_speed", "step_accel", "brake_min"):
                 try:
                     self.cfg_vars[k].set(
                         f"{float(self.cfg_vars[k].get()) * factor:.6g}")
@@ -2419,7 +2541,239 @@ class DynoApp:
         except OSError:
             pass                    # never let this interrupt a run
 
+    # ── Updating from the repository ─────────────────────────
+    @staticmethod
+    def _remote_bytes(path):
+        """Fetch one file from the repository. Raises on any failure."""
+        url = UPDATE_RAW.format(repo=UPDATE_REPO, branch=UPDATE_BRANCH, path=path)
+        with urllib.request.urlopen(url, timeout=UPDATE_TIMEOUT_S) as r:
+            if getattr(r, "status", 200) != 200:
+                raise OSError(f"{path}: HTTP {r.status}")
+            return r.read()
+
+    @staticmethod
+    def _version_in(text, name):
+        """Pull a version literal out of source, without importing it."""
+        m = re.search(name + r'[ =]+"([0-9][^"]*)"', text)
+        return m.group(1) if m else None
+
+    def _remote_versions(self):
+        """What the repository is offering, as (ui, firmware)."""
+        gui = self._remote_bytes(UPDATE_PY_FILES[0][0]).decode("utf-8", "replace")
+        fw = self._remote_bytes(UPDATE_FW_SRC).decode("utf-8", "replace")
+        return (self._version_in(gui, "UI_VERSION"),
+                self._version_in(fw, "#define FW_VERSION"))
+
+    def _update_blocked_reason(self):
+        """Why an update must not run right now, or None if it may."""
+        if self.recording:
+            return "a run is being recorded"
+        if getattr(self, "_char_active", False):
+            return "a brake characterisation sweep is running"
+        if getattr(self, "replay_running", False):
+            return "a replay is running"
+        state = str(self.live.get("state", "")).upper()
+        if state not in ("", "IDLE", "MANUAL", "FAULT"):
+            return f"the controller is in {state}"
+        return None
+
     def _update_from_github(self):
+        """Fetch the current code from the repository and install it.
+
+        Nothing is overwritten until every downloaded Python file has been
+        compiled successfully and the existing files copied aside. A half
+        applied update on the machine driving a brake is worse than no update.
+        """
+        blocked = self._update_blocked_reason()
+        if blocked:
+            messagebox.showwarning(
+                "Not now",
+                f"An update cannot run while {blocked}.\n\n"
+                "Finish or stop what is running first.")
+            return
+
+        self.update_btn.config(state=tk.DISABLED)
+        self.update_status.config(text="Checking the repository...",
+                                  foreground="gray")
+        self.root.update_idletasks()
+        try:
+            ui_remote, fw_remote = self._remote_versions()
+        except Exception as e:                    # any network or parse failure
+            self.update_status.config(text="Could not reach the repository",
+                                      foreground="#B03A2E")
+            self.update_btn.config(state=tk.NORMAL)
+            messagebox.showerror(
+                "Update failed",
+                f"Could not read the repository:\n\n{e}\n\n"
+                "Nothing has been changed.")
+            return
+
+        same = (ui_remote == UI_VERSION)
+        if not messagebox.askyesno(
+                "Update from the repository?",
+                f"Interface: {UI_VERSION} here, {ui_remote or 'unknown'} there"
+                + ("  (already current)" if same else "") +
+                f"\nFirmware: {self.fw_version} on the board, "
+                f"{fw_remote or 'unknown'} there\n\n"
+                "The interface files will be replaced and a copy of the current "
+                "ones kept alongside. The firmware is only downloaded - flashing "
+                "it stays a separate, deliberate step.\n\n"
+                "The program must be restarted afterwards.\n\nContinue?"):
+            self.update_status.config(text="", foreground="gray")
+            self.update_btn.config(state=tk.NORMAL)
+            return
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        staged = {}
+        try:
+            self.update_status.config(text="Downloading...", foreground="gray")
+            self.root.update_idletasks()
+            for path, name in UPDATE_PY_FILES:
+                data = self._remote_bytes(path)
+                text = data.decode("utf-8")
+                # The check that matters: code that will not compile must never
+                # reach the disk this program starts from.
+                compile(text, name, "exec")
+                staged[name] = data
+            for path, name in UPDATE_ASSET_FILES:
+                try:
+                    staged[name] = self._remote_bytes(path)
+                except Exception:
+                    pass                  # an asset is not worth failing over
+        except SyntaxError as e:
+            self.update_status.config(text="Download rejected",
+                                      foreground="#B03A2E")
+            self.update_btn.config(state=tk.NORMAL)
+            messagebox.showerror(
+                "Update rejected",
+                f"The downloaded code does not compile:\n\n{e}\n\n"
+                "Nothing has been changed.")
+            return
+        except Exception as e:
+            self.update_status.config(text="Download failed",
+                                      foreground="#B03A2E")
+            self.update_btn.config(state=tk.NORMAL)
+            messagebox.showerror(
+                "Update failed",
+                f"Download failed:\n\n{e}\n\nNothing has been changed.")
+            return
+
+        backup = os.path.join(here, f"backup_{stamp}")
+        try:
+            os.makedirs(backup, exist_ok=True)
+            for name in staged:
+                src = os.path.join(here, name)
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(backup, name))
+            for name, data in staged.items():
+                # Write beside the target and replace, so an interrupted write
+                # cannot leave a half-written file where the real one was.
+                tmp = os.path.join(here, name + ".new")
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, os.path.join(here, name))
+        except OSError as e:
+            self.update_status.config(text="Install failed",
+                                      foreground="#B03A2E")
+            self.update_btn.config(state=tk.NORMAL)
+            messagebox.showerror(
+                "Update failed",
+                f"Could not write the files:\n\n{e}\n\n"
+                f"The previous files are in:\n{backup}")
+            return
+
+        fw_msg = ""
+        try:
+            fw = self._remote_bytes(UPDATE_FW_PATH)
+            fwdir = os.path.join(here, "fw_new")
+            os.makedirs(fwdir, exist_ok=True)
+            with open(os.path.join(fwdir, "firmware.bin"), "wb") as f:
+                f.write(fw)
+            fw_msg = (f"\n\nFirmware {fw_remote or ''} downloaded to "
+                      f"fw_new/firmware.bin ({len(fw):,} bytes). It has NOT "
+                      "been flashed - use Flash downloaded firmware once this "
+                      "program has been restarted.")
+            self._fw_downloaded = os.path.join(fwdir, "firmware.bin")
+        except Exception as e:
+            fw_msg = (f"\n\nThe firmware binary could not be downloaded "
+                      f"({e}). The interface was still updated.")
+
+        self.update_status.config(text=f"Updated to {ui_remote} - restart",
+                                  foreground="#1E8449")
+        self._log_event(f"Updated from the repository to {ui_remote}; "
+                        f"previous files in backup_{stamp}", "ack")
+        messagebox.showinfo(
+            "Update installed",
+            f"Interface updated to {ui_remote or 'the current version'}.\n\n"
+            f"The previous files are in:\n{backup}" + fw_msg +
+            "\n\nRestart the program for the change to take effect.")
+
+    def _flash_downloaded_firmware(self):
+        """Flash a firmware binary that was downloaded earlier.
+
+        Kept separate from the download on purpose: this reboots the controller
+        that holds the brake, and wants the serial port to itself.
+        """
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fw_new", "firmware.bin")
+        if not os.path.exists(path):
+            messagebox.showinfo(
+                "Nothing to flash",
+                "No downloaded firmware found. Run Update from GitHub first.")
+            return
+        blocked = self._update_blocked_reason()
+        if blocked:
+            messagebox.showwarning(
+                "Not now", f"The board cannot be flashed while {blocked}.")
+            return
+        if self.ser and self.ser.is_open:
+            messagebox.showwarning(
+                "Disconnect first",
+                "Flashing needs the serial port to itself.\n\n"
+                "Disconnect, then flash.")
+            return
+        port = self.port_var.get().strip()
+        if not port:
+            messagebox.showwarning("No port", "Choose the controller's port first.")
+            return
+        if not messagebox.askyesno(
+                "Flash the controller?",
+                f"This writes {os.path.basename(path)} to the board on {port} "
+                "and restarts it.\n\nThe brake must not be under load. "
+                "Continue?"):
+            return
+
+        cmd = ["esptool.py", "--chip", "esp32s3", "--port", port,
+               "--baud", "460800", "--before", "default-reset",
+               "--after", "hard-reset", "write-flash", "-z",
+               "--flash-mode", "keep", "--flash-freq", "keep",
+               "--flash-size", "keep", "0x10000", path]
+        self.update_status.config(text="Flashing...", foreground="gray")
+        self.root.update_idletasks()
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=180)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.update_status.config(text="Flash failed", foreground="#B03A2E")
+            messagebox.showerror("Flash failed", f"Could not run esptool:\n\n{e}")
+            return
+        if out.returncode == 0 and "Hash of data verified" in (out.stdout or ""):
+            self.update_status.config(text="Flashed", foreground="#1E8449")
+            self._log_event("Controller flashed from the downloaded firmware",
+                            "ack")
+            messagebox.showinfo(
+                "Flashed",
+                "The controller was flashed and restarted.\n\n"
+                "Reconnect, then use Send all to controller - a freshly "
+                "flashed board starts on firmware defaults.")
+        else:
+            self.update_status.config(text="Flash failed", foreground="#B03A2E")
+            tail = (out.stderr or out.stdout or "")[-600:]
+            messagebox.showerror("Flash failed",
+                                 f"esptool exited {out.returncode}:\n\n{tail}")
+
+
         """TBD - fetch the current interface and firmware from the repository.
 
         Deliberately unimplemented rather than half-implemented: pulling code
@@ -3035,6 +3389,7 @@ class DynoApp:
         self._clear_plot()
         self.recorded_torque_is_nm = self.replay_rec.torque_is_nm
         self.recording = True
+        self._run_started = time.time()
         self.auto_recording = True
         self.replay_running = True
         self.replay_paused = False
@@ -3120,6 +3475,7 @@ class DynoApp:
     def _auto_record_start(self):
         if not self.recording:
             self.recording = True
+            self._run_started = time.time()
             self.auto_recording = True
 
     def _auto_record_stop(self):
@@ -3720,6 +4076,12 @@ class DynoApp:
             "_torque_units": self.units_var.get(),
             "_torque_calibrated": bool(self.recorded_torque_is_nm),
             "_samples": len(self.log_rows),
+            "_notes": self._get_notes(),
+            # When the note was last touched, so a note carried over from an
+            # earlier pull can be told apart from one written for this run.
+            "_notes_edited": (time.strftime("%Y-%m-%d %H:%M:%S",
+                                           time.localtime(self._notes_edited))
+                              if self._notes_edited else None),
             "_brake_char_stall": self._char_stall_at,
             "_controller_cfg": [line for _tag, line in list(self.events)
                                 if "CFG," in line][-40:],

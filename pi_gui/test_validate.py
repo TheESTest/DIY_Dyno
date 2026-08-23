@@ -104,6 +104,40 @@ app._update_gui()
 check("short window not flagged",
       "too slow" in app.rpm_lag_label.cget("text"), False)
 
+
+# --- the brake range, which is what actually reached the controller -------
+# Reproduces the report: a minimum left over from the old 6250-step geometry
+# is at or above the new 500-step maximum.
+app.cfg_vars["brake_min"].set("1000")
+app.cfg_vars["brake_max"].set("500")
+p = app._validate_cfg()
+check("stale minimum above the new max is caught",
+      any("must be below max" in x for x in p), True)
+check("and explains why it happens",
+      any("drivetrain" in x for x in p), True)
+app.cfg_vars["brake_min"].set("500")
+check("equal min and max is caught too",
+      any("must be below max" in x for x in app._validate_cfg()), True)
+app.cfg_vars["brake_min"].set("-5")
+check("negative minimum is caught",
+      any("cannot be negative" in x for x in app._validate_cfg()), True)
+app.cfg_vars["brake_min"].set("abc")
+check("non-numeric range is caught",
+      any("must be numbers" in x for x in app._validate_cfg()), True)
+app.cfg_vars["brake_min"].set("0")
+app.cfg_vars["brake_max"].set("500")
+check("a sane range passes", app._validate_cfg(), [])
+
+# nothing is sent while the range is impossible
+app.ser = FakeSerial()
+app.cfg_vars["brake_min"].set("1000")
+sent.clear(); shown.clear()
+app._send_all_config()
+check("send all blocked by a bad brake range", sent, [])
+check("named the brake range", "Brake range" in shown[0][1], True)
+app.cfg_vars["brake_min"].set("0")
+app.ser = None
+
 app.ser = None
 app.on_close()
 print("FAILURES: " + ("none" if not fails else "\n  " + "\n  ".join(fails)))

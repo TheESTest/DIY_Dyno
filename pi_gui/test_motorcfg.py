@@ -112,12 +112,30 @@ check("no longer flagged",
       str(app.fw_version_label.cget("foreground")), "black")
 
 check("update button exists", app.update_btn is not None, True)
-check("update button greyed out", str(app.update_btn.cget("state")), "disabled")
+# Enabled now that fetching is implemented; test_update.py covers what it
+# refuses to do. The flash button is separate on purpose.
+check("update button usable", str(app.update_btn.cget("state")), "normal")
+check("flashing is a separate button", app.flash_btn is not None, True)
 
 # --- carried by profiles --------------------------------------------------
 snap = app._profile_snapshot()
 for k in ("motor_steps", "driver_steps", "gearbox", "cam_angle"):
     check(f"profile keeps {k}", k in snap, True)
+
+
+# --- brake_min is a step position, so it must scale with the travel -------
+messagebox.askyesno = lambda t, m, **k: True
+app.cfg_vars["brake_max"].set("6250")
+app.cfg_vars["brake_min"].set("1000")        # a real minimum on the old scale
+app.cfg_vars["step_speed"].set("10000"); app.cfg_vars["step_accel"].set("50000")
+app._apply_drivetrain()
+check("minimum rescaled with the travel",
+      float(app.cfg_vars["brake_min"].get()), 80.0)
+check("range still valid after the change",
+      float(app.cfg_vars["brake_min"].get())
+      < float(app.cfg_vars["brake_max"].get()), True)
+check("nothing the controller would reject", app._validate_cfg(), [])
+app.cfg_vars["brake_min"].set("0")
 
 
 # --- branding -------------------------------------------------------------
