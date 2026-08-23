@@ -23,18 +23,42 @@ root=tk.Tk(); app=dyno_gui.DynoApp(root)
 class FakeSer: is_open=True
 sent=[]
 TAKEUP=2200.0          # nothing happens below this
+
+# The controller now runs a whole leg from one command, so the fake has to model
+# a move in flight rather than a position per tick: BRAKE_SWEEP starts a timed
+# traverse, and the position is interpolated as time passes.
+import time as _time
+move={"from":0.0,"to":0.0,"t0":0.0,"secs":0.0}
+
+def _apply(pos):
+    over=max(0.0, pos-TAKEUP)
+    psi = over*0.30
+    if app._char_rows and app._char_rows[-1][1]=="down":
+        psi *= 1.18              # retracting holds pressure a little longer
+    with app._lock:
+        app.live["brake_pos"]=int(pos)
+        app.live["press_psi"]=psi
+        app.live["press_mv"]=500+psi*2
+
+def advance():
+    """Where the traverse has got to by now."""
+    if move["secs"] <= 0:
+        return
+    f = (_time.monotonic()-move["t0"])/move["secs"]
+    f = 0.0 if f < 0 else (1.0 if f > 1 else f)
+    _apply(move["from"] + (move["to"]-move["from"])*f)
+
 def fake_send(cmd):
     sent.append(cmd)
-    if cmd.startswith("BRAKE,"):
-        pos=float(cmd.split(",")[1])
-        over=max(0.0, pos-TAKEUP)
-        psi = over*0.30
-        if app._char_rows and app._char_rows[-1][1]=="down":
-            psi *= 1.18          # retracting holds pressure a little longer
+    if cmd.startswith("BRAKE_SWEEP,"):
+        _, tgt, ms = cmd.split(",")
         with app._lock:
-            app.live["brake_pos"]=int(pos)
-            app.live["press_psi"]=psi
-            app.live["press_mv"]=500+psi*2
+            cur=float(app.live["brake_pos"])
+        move.update({"from":cur,"to":float(tgt),
+                     "t0":_time.monotonic(),"secs":float(ms)/1000.0})
+    elif cmd.startswith("BRAKE,"):
+        move["secs"]=0.0                       # a direct move lands at once
+        _apply(float(cmd.split(",")[1]))
 app._send=fake_send
 
 # ---- guards ----
@@ -75,6 +99,7 @@ try:
     import time as _t
     for _ in range(400):
         if not app._char_active: break
+        advance()                 # the traverse progresses between ticks
         app._char_tick(); _t.sleep(0.006)
     check("sweep finished", app._char_active, False)
 

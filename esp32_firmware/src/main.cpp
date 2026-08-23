@@ -25,6 +25,7 @@
 //             INVERT,<0|1>  STEPPER_SPEED,<v>  STEPPER_ACCEL,<v>
 //             VERSION (firmware version and build stamp)
 //             ENCODER,<0|1>,<cpr>,<invert>   TBD - stored, not yet active
+//             BRAKE_SWEEP,<target>,<ms>  one smooth timed traverse
 //             RPM_BAND,<min>,<max>  RPM_MEDIAN,<1|3|5|7>  RPM_RATIO,<x>
 //             RPM_EXTRAP,<0|1>,<points>,<maxrun>
 //             RPM_SLEW,<rpm/s>  RPM_AVG,<n>  TACH_RESET
@@ -68,7 +69,7 @@
 // Firmware version. Bump the minor when the serial protocol changes shape
 // (a new DATA field, a renamed command) so a mismatched GUI is diagnosable
 // from the log rather than from guesswork about which build is on the board.
-#define FW_VERSION "1.2.2"
+#define FW_VERSION "1.3.0"
 
 // ─────────────────────────────────────────────────────────────────────
 // STEPPER ENCODER - TBD, HARDWARE NOT FITTED
@@ -932,6 +933,19 @@ static void controlBrake(float setpoint, float dt) {
 // Common-anode: ENA active = driver DISABLED (inhibit signal)
 // So enable driver = opto OFF (GPIO HIGH), disable = opto ON (GPIO LOW)
 // =============================================
+// A timed sweep temporarily lowers the speed ceiling so one moveTo() covers
+// the whole travel at a steady rate. The normal ceiling is put back as soon
+// as the move finishes, or the moment anything else commands the brake -
+// leaving it lowered would silently slow a STOP.
+bool sweepSpeedActive = false;
+
+static void clearSweepSpeed() {
+    if (sweepSpeedActive) {
+        stepper.setMaxSpeed(stepperMaxSpeed);
+        sweepSpeedActive = false;
+    }
+}
+
 static void enableStepper(bool en) {
     digitalWrite(PIN_STEPPER_ENABLE, en ? HIGH : LOW);
 }
@@ -1081,7 +1095,41 @@ static void processCommand(const char* cmd) {
     }
 
     // ---- Absolute brake position ----
+    // BRAKE_SWEEP,<target>,<ms> - traverse to target over roughly ms, as one
+    // continuous move. Re-commanding a moving target at 20 Hz instead makes
+    // AccelStepper decelerate to a stop at every intermediate point, which
+    // is a lurch 20 times a second rather than a smooth traverse.
+    if (s.startsWith("BRAKE_SWEEP,")) {
+        int i1 = s.indexOf(',', 12);
+        if (i1 < 0) {
+            Serial.println("ERR,BRAKE_SWEEP needs target,ms");
+            return;
+        }
+        long pos = constrain(s.substring(12, i1).toInt(), 0L, brakeMaxSteps);
+        long ms  = s.substring(i1 + 1).toInt();
+        if (ms < 50) {
+            Serial.println("ERR,BRAKE_SWEEP duration must be >= 50 ms");
+            return;
+        }
+        clearSweepSpeed();
+        long dist = labs(pos - stepper.currentPosition());
+        currentState = STATE_MANUAL;
+        enableStepper(true);
+        if (dist > 0) {
+            float v = (float)dist / ((float)ms / 1000.0f);
+            if (v < 1.0f) v = 1.0f;
+            // Never faster than the configured ceiling: a short duration is a
+            // request, not permission to exceed the machine's limit.
+            if (v > stepperMaxSpeed) v = stepperMaxSpeed;
+            stepper.setMaxSpeed(v);
+            sweepSpeedActive = true;
+        }
+        stepper.moveTo(pos);
+        brakeCommandSteps = (float)pos;
+        return;
+    }
     if (s.startsWith("BRAKE,")) {
+        clearSweepSpeed();
         // Manual moves may go to 0 (fully released) but never past the
         // configured maximum — over-stroking the cam drives it back over centre
         // and can break the linkage.
@@ -2049,6 +2097,8 @@ void loop() {
     unsigned long now = millis();
 
     stepper.run();
+    // Hand the speed ceiling back the moment a timed sweep lands.
+    if (sweepSpeedActive && stepper.distanceToGo() == 0) clearSweepSpeed();
     readSerial();
 
     if (simMode) {

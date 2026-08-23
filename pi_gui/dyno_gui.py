@@ -110,7 +110,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.2.2"
+UI_VERSION = "1.3.0"
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dyno_runs")
 
@@ -368,6 +368,8 @@ class DynoApp:
         self._char_active = False
         self._char_rows = []
         self._char_home = 0
+        self._char_hi = 0.0
+        self._char_phase_sent = None
         self._char_engaged = False
         self._char_base_psi = None
         self._char_susp_since = None
@@ -1474,11 +1476,17 @@ class DynoApp:
 
         with self._lock:
             self._char_home = int(self.live["brake_pos"])
+        try:
+            self._char_hi = float(self.cfg_vars["brake_max"].get())
+        except ValueError:
+            self._char_hi = float(BRAKE_FULL_TRAVEL_STEPS)
         self._char_rows = []
+        self._char_phase_sent = None
         self._char_engaged = False
         self._char_base_psi = None
         self._char_susp_since = None
         self._char_stall_at = None
+        self._char_phase_sent = None
         self.char_stall_label.config(text="")
         self._char_active = True
         self._char_t0 = time.monotonic()
@@ -1495,14 +1503,27 @@ class DynoApp:
             self._send(f"BRAKE,{int(self._char_home)}")
             self._finish_brake_char()
             return
-        self._send(f"BRAKE,{int(round(target))}")
+        # One command per leg. Re-issuing a moving target every tick makes the
+        # controller decelerate to a stop at each one - a lurch 20 times a
+        # second rather than a traverse. The firmware is told the whole leg
+        # and its duration, and runs it as a single steady move.
+        if phase != self._char_phase_sent:
+            self._char_phase_sent = phase
+            if phase == 'up':
+                self._send(f"BRAKE_SWEEP,{int(round(self._char_hi))},"
+                           f"{int(CHAR_UP_S * 1000)}")
+            elif phase == 'down':
+                self._send(f"BRAKE_SWEEP,{int(round(self._char_home))},"
+                           f"{int(CHAR_DOWN_S * 1000)}")
+            # 'hold' needs no command: it is already where the leg ends.
         with self._lock:
             d = dict(self.live)
         # Only the outward leg: on the way back position falls by design, so
         # the comparison means nothing there.
         stalled = False
         if phase == "up":
-            stalled = self._char_check_stall(elapsed, target, d["press_psi"])
+            stalled = self._char_check_stall(
+                elapsed, float(d["brake_pos"]), d["press_psi"])
 
         self._char_rows.append([
             f"{elapsed:.3f}", phase, f"{target:.1f}",
@@ -1534,7 +1555,7 @@ class DynoApp:
                      f"{d['press_psi']:.0f} PSI")
         self.root.after(CHAR_TICK_MS, self._char_tick)
 
-    def _char_check_stall(self, elapsed, target, psi):
+    def _char_check_stall(self, elapsed, pos, psi):
         """Watch for commanded position climbing while pressure does not.
 
         Returns True the moment a stall is first suspected. A fully applied
@@ -1564,7 +1585,7 @@ class DynoApp:
         if past is None:
             return False
 
-        dpos = target - float(past[2])
+        dpos = pos - float(past[3])
         dpsi = psi - float(past[5])
         if dpos >= CHAR_STALL_STEPS and dpsi < CHAR_STALL_PSI:
             if self._char_susp_since is None:
@@ -1572,7 +1593,7 @@ class DynoApp:
             elif elapsed - self._char_susp_since >= CHAR_STALL_HOLD_S:
                 self._char_stall_at = {
                     "time_s": round(elapsed, 2),
-                    "commanded": round(target, 1),
+                    "commanded": round(pos, 1),
                     "psi": round(psi, 2),
                     "steps_gained": round(dpos, 1),
                     "psi_gained": round(dpsi, 2),
