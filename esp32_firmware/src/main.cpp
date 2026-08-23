@@ -69,7 +69,7 @@
 // Firmware version. Bump the minor when the serial protocol changes shape
 // (a new DATA field, a renamed command) so a mismatched GUI is diagnosable
 // from the log rather than from guesswork about which build is on the board.
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.4.0"
 
 // ─────────────────────────────────────────────────────────────────────
 // STEPPER ENCODER - TBD, HARDWARE NOT FITTED
@@ -132,35 +132,40 @@ static void updateEncoder() {
 #define RPM_FAULT_TIMEOUT_US 300000  // 0.3 s with no pulse while controlling
 #define RPM_MEDIAN_MAX       7       // Longest median window on pulse intervals
 
-// Stepper defaults
-#define STEPPER_MAX_SPEED    10000.0f
-#define STEPPER_ACCEL        50000.0f
-// Brake travel on this rig, in MICROSTEPS - the driver runs 5000 microsteps per
-// motor revolution, not 200 full steps:
-//   5000 microsteps/rev x 10:1 planetary = 50000 per cam revolution
-//   50000 / 360 deg                      = 138.889 microsteps per degree
-//   45 deg of usable cam                 = 6250 microsteps
-// Homing sits about a quarter motor turn (1250) clear of full travel, so a
-// measured home-to-max span near 7600 is the expected figure.
-#define BRAKE_MAX_STEPS_DEF  6250    // Default full-travel limit (runtime: BRAKE_RANGE)
-#define CAM_STEPS_PER_DEG_DEF 138.889f
-#define HOMING_SPEED         2000.0f // Homing approach speed (microsteps/sec)
+// Stepper defaults, scaled with the driver change so the physical motion is
+// unchanged: 800 steps/s at 400 steps/rev is the same 2 motor rev/s that
+// 10000 was at 5000 steps/rev, and still crosses the travel in about 0.6 s.
+#define STEPPER_MAX_SPEED    800.0f
+#define STEPPER_ACCEL        4000.0f
+// Brake travel in DRIVER STEPS. The driver DIP switches are now set to 400
+// steps per motor revolution - half stepping on a 200 full-step motor, not
+// the 5000 it was set to before:
+//   400 steps/rev x 10:1 planetary = 4000 per cam revolution
+//   4000 / 360 deg                 = 11.111 steps per degree
+//   45 deg of usable cam           = 500 steps
+//   a quarter cam turn             = 1000 steps
+// The GUI derives all of this from the motor, driver and gearbox figures and
+// can push it down, so these are the fallback for an unconfigured board.
+#define BRAKE_MAX_STEPS_DEF  500     // Default full-travel limit (runtime: BRAKE_RANGE)
+#define CAM_STEPS_PER_DEG_DEF 11.111f
+#define HOMING_SPEED         160.0f  // Homing approach speed (driver steps/sec)
 
-// PID defaults, sized against the real 6250-MICROSTEP travel: the loop output
-// IS a step position, so Kp is microsteps of brake per RPM of error. Kp 6.25
-// reaches full brake at about 1000 RPM of error. An earlier 0.25 was scaled
-// for a mistaken 250-step travel and left the proportional term only 4 percent
-// of the range, so the integrator was doing nearly all the work. Starting
-// points to tune from on the stand, not tuned values.
-#define DEFAULT_PID_KP       6.25f
-#define DEFAULT_PID_KI       10.0f
-#define DEFAULT_PID_KD       0.25f
+// PID defaults, sized against the 500-step travel the current drivetrain gives
+// (400 driver steps/rev x 10:1, 45 deg of cam). The loop output IS a step
+// position, so Kp is driver steps of brake per RPM of error, and Kp 0.5
+// reaches full brake at about 1000 RPM of error - the same authority the old
+// 6.25 had against 6250 steps. Move the driver DIP switches and these must be
+// rescaled by the same factor, or the loop is wrong by exactly that much.
+// Starting points to tune from on the stand, not tuned values.
+#define DEFAULT_PID_KP       0.5f
+#define DEFAULT_PID_KI       0.8f
+#define DEFAULT_PID_KD       0.02f
 // Sweep is softer than hold, matching the reference system's split (its 20% /
 // 12% pair) — the brake has to catch hard during throttle-up but must not fight
 // a near-instantaneous hydraulic during the pull.
-#define DEFAULT_SWEEP_KP     3.75f
-#define DEFAULT_SWEEP_KI     6.25f
-#define DEFAULT_SWEEP_KD     0.125f
+#define DEFAULT_SWEEP_KP     0.3f
+#define DEFAULT_SWEEP_KI     0.5f
+#define DEFAULT_SWEEP_KD     0.01f
 
 // RPM tolerance for hold detection
 #define RPM_HOLD_TOLERANCE   0.05f   // ±5% of target RPM

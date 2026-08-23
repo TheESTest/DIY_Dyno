@@ -6,8 +6,8 @@ a stepper-actuated hydraulic brake.
 
 | Component | Version | Location |
 |---|---|---|
-| Raspberry Pi UI | 1.3.0 | [`pi_gui/`](pi_gui/) |
-| ESP32-S3 firmware | 1.3.0 | [`esp32_firmware/`](esp32_firmware/) |
+| Raspberry Pi UI | 1.4.0 | [`pi_gui/`](pi_gui/) |
+| ESP32-S3 firmware | 1.4.0 | [`esp32_firmware/`](esp32_firmware/) |
 
 Both versions are recorded in the `_conditions.json` file saved beside every
 run, so a result can be traced back to the code that produced it. The UI shows
@@ -24,12 +24,27 @@ serial terminal when something needs diagnosing.
 
 ### The control loop
 
-The PID input is **RPM error** and its output is **brake position in
-microsteps**, so `Kp` is microsteps of brake per RPM of error. Line pressure is
-*not* feedback — it appears only as a safety limit. The brake geometry is 5000
-microsteps per motor revolution through a 10:1 planetary, giving 138.889
-microsteps per degree of cam and 6250 microsteps across the 45° of usable
-travel.
+The PID input is **RPM error** and its output is **brake position in driver
+steps**, so `Kp` is steps of brake per RPM of error. Line pressure is *not*
+feedback — it appears only as a safety limit.
+
+Every step figure is derived from three drivetrain settings in the UI, because
+those are what change when a DIP switch moves, and a step count that silently
+disagrees with the driver reads as a mechanical fault:
+
+| Setting | As built |
+|---|---|
+| Motor full steps per rev | 200 |
+| Driver steps per rev (DIP) | 400 — half stepping |
+| Gearbox reduction | 10 : 1 |
+| Usable cam angle | 45° |
+
+which gives 4000 steps per cam revolution, 11.111 per degree, 500 across the
+usable travel, and 1000 for a quarter cam turn. Changing the driver setting
+rescales the travel, and `Kp` has to move with it: applying a new drivetrain
+offers to rescale the gains, speed and acceleration by the same factor, because
+gains left behind are wrong by exactly that much — and too high means the brake
+slams on for a small error.
 
 ### RPM conditioning
 

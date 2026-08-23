@@ -197,17 +197,27 @@ app._compute_pressure()
 check("gauge measurement overrides spec",
       round(float(app.cfg_vars["press_psi_mv"].get()), 4), 0.58)
 
-# ── Brake travel defaults match the built geometry ──
-check("full travel is 6250 microsteps", dyno_gui.BRAKE_FULL_TRAVEL_STEPS, 6250)
-check("microsteps per degree", round(dyno_gui.CAM_STEPS_PER_DEGREE, 3), 138.889)
-check("5000 microsteps/rev x 10:1 over 45 deg gives the travel",
-      round(5000 * 10 * 45 / 360), dyno_gui.BRAKE_FULL_TRAVEL_STEPS)
+# ── Brake travel defaults are derived from the drivetrain ──
+# Driver is set to 400 steps/rev (half stepping a 200-step motor) through 10:1,
+# so a cam revolution is 4000 steps and the usable 45 deg is 500.
+check("full travel is 500 steps", dyno_gui.BRAKE_FULL_TRAVEL_STEPS, 500)
+check("steps per degree", round(dyno_gui.CAM_STEPS_PER_DEGREE, 3), 11.111)
+check("400 steps/rev x 10:1 over 45 deg gives the travel",
+      round(400 * 10 * 45 / 360), dyno_gui.BRAKE_FULL_TRAVEL_STEPS)
+check("derived, not hard-coded",
+      round(dyno_gui.drivetrain(400, 10.0, 45.0, 200)["cam_travel"]),
+      dyno_gui.BRAKE_FULL_TRAVEL_STEPS)
 # fresh instance: earlier tests in this file deliberately mutate step_speed
 _r = tk.Tk(); _a = dyno_gui.DynoApp(_r)
-check("stepper speed default sized for microsteps",
-      int(_a.cfg_vars["step_speed"].get()) >= 10000, True)
-check("acceleration raised to match",
-      int(_a.cfg_vars["step_accel"].get()) >= 20000, True)
+# 800 steps/s at 400 steps/rev is the same 2 motor rev/s that 10000 was at 5000.
+check("stepper speed scaled with the driver change",
+      float(_a.cfg_vars["step_speed"].get()), 800.0)
+check("acceleration scaled with it",
+      float(_a.cfg_vars["step_accel"].get()), 4000.0)
+_cross = (dyno_gui.BRAKE_FULL_TRAVEL_STEPS
+          / float(_a.cfg_vars["step_speed"].get()))
+check("speed still crosses the travel in well under a second",
+      0.4 < _cross < 0.8, True)
 _r.destroy()
 
 # ── Profile round-trips every new setting ──

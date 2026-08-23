@@ -86,8 +86,42 @@ CAM_TABLE_ROWS = 8
 #   50000 / 360 = 138.889 microsteps per degree;  45 deg = 6250 microsteps.
 # Homing sits about a quarter motor turn clear of full travel, so a measured
 # home-to-max span near 7600 is expected, not a sign of anything wrong.
-BRAKE_FULL_TRAVEL_STEPS = 6250
-CAM_STEPS_PER_DEGREE = 138.889
+# Drivetrain as built. Every step figure below is derived from these three,
+# because they are the ones that change when a DIP switch moves - and a step
+# count that silently disagrees with the driver is the kind of error that
+# reads as a mechanical fault.
+MOTOR_STEPS_PER_REV = 200        # full steps of the motor itself
+DRIVER_STEPS_PER_REV = 400       # what the driver DIP switches are set to
+GEARBOX_RATIO = 10.0             # planetary reduction onto the cam
+CAM_ANGLE_DEG = 45.0             # usable rotation of the cam
+
+
+def drivetrain(driver_steps, gearbox, cam_deg, motor_steps=None):
+    """Every derived step figure for one drivetrain configuration.
+
+    driver_steps is what the driver actually emits per motor revolution, so
+    it already carries the microstepping: 400 on a 200-step motor is half
+    stepping. Returns None if the inputs cannot describe a real drivetrain.
+    """
+    if driver_steps <= 0 or gearbox <= 0 or cam_deg <= 0:
+        return None
+    per_output = driver_steps * gearbox
+    d = {
+        "per_motor_rev": driver_steps,
+        "per_output_rev": per_output,
+        "per_degree": per_output / 360.0,
+        "quarter_output_turn": per_output / 4.0,
+        "cam_travel": per_output * (cam_deg / 360.0),
+    }
+    if motor_steps and motor_steps > 0:
+        d["microstep_factor"] = driver_steps / motor_steps
+    return d
+
+
+_DT = drivetrain(DRIVER_STEPS_PER_REV, GEARBOX_RATIO, CAM_ANGLE_DEG,
+                 MOTOR_STEPS_PER_REV)
+BRAKE_FULL_TRAVEL_STEPS = int(round(_DT["cam_travel"]))
+CAM_STEPS_PER_DEGREE = round(_DT["per_degree"], 4)
 
 # AiM car/bike pressure sensor (Pegasus MC-327 and siblings). Every sensor in
 # that range shares the same electrical characterisation — 500 mV at zero and
@@ -110,7 +144,13 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.3.0"
+UI_VERSION = "1.4.0"
+
+# Shipped alongside the code. PNG rather than the original JPEG because Tk
+# reads PNG natively - loading a JPEG would mean depending on Pillow at
+# runtime just to draw a logo.
+LOGO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "centurial_logo.png")
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dyno_runs")
 
@@ -144,7 +184,7 @@ CHAR_STALL_HOLD_S = 1.0      # how long it must persist before flagging
 # visibly responds to the replayed data, geared WAY down so it moves gently.
 MOTOR_DEMO_SPEED = 1000    # stepper max speed (steps/s) — visible but not flying
 MOTOR_DEMO_ACCEL = 1500    # stepper accel (steps/s^2)
-MOTOR_FULL_STEPS = 6250    # matches firmware BRAKE_MAX_STEPS_DEF (full travel)
+MOTOR_FULL_STEPS = BRAKE_FULL_TRAVEL_STEPS   # replay demo uses the real travel
 MOTOR_SEND_HZ    = 8       # BRAKE command rate to the ESP during replay
 
 # DATA frame field layout (matches ESP32-S3 firmware sendDataReport()):
@@ -306,6 +346,11 @@ class DynoApp:
             "rpm_ratio":     tk.StringVar(value="3.0"),
             "rpm_slew":      tk.StringVar(value="0"),
             "rpm_avg":       tk.StringVar(value="3"),
+            # Drivetrain - everything else in steps is derived from these
+            "motor_steps":  tk.StringVar(value=str(MOTOR_STEPS_PER_REV)),
+            "driver_steps": tk.StringVar(value=str(DRIVER_STEPS_PER_REV)),
+            "gearbox":      tk.StringVar(value=str(GEARBOX_RATIO)),
+            "cam_angle":    tk.StringVar(value=str(CAM_ANGLE_DEG)),
             "brake_min":    tk.StringVar(value="0"),
             "brake_max":    tk.StringVar(value=str(BRAKE_FULL_TRAVEL_STEPS)),
             "preload_pct":  tk.StringVar(value="20"),
@@ -316,8 +361,8 @@ class DynoApp:
             "throttle_off":   tk.StringVar(value="50"),
             "stop_rate":      tk.StringVar(value="200"),
             "invert":       tk.BooleanVar(value=True),
-            "step_speed":   tk.StringVar(value="10000"),
-            "step_accel":   tk.StringVar(value="50000"),
+            "step_speed":   tk.StringVar(value="800"),
+            "step_accel":   tk.StringVar(value="4000"),
             "cam_model":    tk.StringVar(value=CAM_MODELS[0]),
             "cam_spd":      tk.StringVar(value=str(CAM_STEPS_PER_DEGREE)),
             "cam_lin":      tk.BooleanVar(value=False),
@@ -363,6 +408,7 @@ class DynoApp:
         # Snapshot the untouched state before anything overwrites it. This is
         # what Restore Defaults puts back, so there is no second copy of the
         # default values to drift out of step with the real ones.
+        self._update_drivetrain()
         self._factory_defaults = self._profile_snapshot()
         self._session_written = None
         self._char_active = False
@@ -380,6 +426,7 @@ class DynoApp:
 
     # ── GUI Construction ─────────────────────────────────────
     def _build_gui(self):
+        self._build_branding(self.root)
         top = ttk.Frame(self.root)
         top.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
         self._build_connection_bar(top)
@@ -440,6 +487,31 @@ class DynoApp:
         self.events.append((tag, f"{time.strftime('%H:%M:%S')}  {text}"))
 
     # ── Connection bar ───────────────────────────────────────
+    def _build_branding(self, parent):
+        """Company mark and name across the top of the window.
+
+        A missing or unreadable logo must never stop the program starting, so
+        the name is shown either way and the image is simply left out.
+        """
+        bar = tk.Frame(parent, bg="white")
+        bar.pack(side=tk.TOP, fill=tk.X)
+        self.logo_image = None
+        try:
+            # master= matters: an image with no interpreter named belongs to
+            # whichever root was made first, and drawing it in a different
+            # window then fails with 'image does not exist'.
+            self.logo_image = tk.PhotoImage(master=parent, file=LOGO_FILE)
+        except (tk.TclError, OSError):
+            self.logo_image = None
+        if self.logo_image is not None:
+            tk.Label(bar, image=self.logo_image, bg="white").pack(
+                side=tk.LEFT, padx=(8, 6), pady=4)
+        tk.Label(bar, text="Centurial Inc", bg="white", fg="#1B3A6B",
+                 font=("TkDefaultFont", 14, "bold")).pack(side=tk.LEFT, pady=4)
+        tk.Label(bar, text="Engine Dynamometer", bg="white", fg="#5A6B85",
+                 font=("TkDefaultFont", 10)).pack(side=tk.LEFT, padx=8, pady=4)
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X)
+
     def _build_connection_bar(self, parent):
         frame = ttk.LabelFrame(parent, text="Connection")
         frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -753,9 +825,9 @@ class DynoApp:
         self.pid_vars: dict[str, tk.StringVar] = {}
         self.pid_sweep_vars: dict[str, tk.StringVar] = {}
         for label_text, key, hold_default, sweep_default in [
-                ("Kp:", "kp", "6.25", "3.75"),
-                ("Ki:", "ki", "10.0", "6.25"),
-                ("Kd:", "kd", "0.25", "0.125")]:
+                ("Kp:", "kp", "0.5", "0.3"),
+                ("Ki:", "ki", "0.8", "0.5"),
+                ("Kd:", "kd", "0.02", "0.01")]:
             row = ttk.Frame(pidf)
             row.pack(fill=tk.X, padx=4, pady=1)
             ttk.Label(row, text=label_text, width=6, anchor=tk.W).pack(side=tk.LEFT)
@@ -1176,6 +1248,36 @@ class DynoApp:
         # ── Brake actuator ────────────────────────────────────
         bk = ttk.LabelFrame(right, text="Brake actuator")
         bk.pack(fill=tk.X, pady=4)
+        mf = ttk.LabelFrame(bk, text="Motor and drivetrain")
+        mf.pack(fill=tk.X, padx=4, pady=(4, 6))
+        ttk.Label(mf, wraplength=370, justify=tk.LEFT, foreground="gray",
+                  text=("Step counts everywhere else are derived from these. "
+                        "Driver steps per rev is what the DIP switches are set "
+                        "to and already includes microstepping - 400 on a "
+                        "200-step motor is half stepping.")
+                  ).pack(anchor=tk.W, padx=4, pady=2)
+        for label, key, suffix in (
+                ("Motor full steps/rev:", "motor_steps", "typically 200"),
+                ("Driver steps/rev:", "driver_steps", "DIP setting"),
+                ("Gearbox reduction:", "gearbox", ": 1"),
+                ("Usable cam angle:", "cam_angle", "degrees")):
+            row = ttk.Frame(mf)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            ttk.Label(row, text=label, width=22,
+                      anchor=tk.W).pack(side=tk.LEFT)
+            e = ttk.Entry(row, textvariable=self.cfg_vars[key], width=9)
+            e.pack(side=tk.LEFT)
+            self.cfg_vars[key].trace_add("write",
+                                         lambda *a: self._update_drivetrain())
+            ttk.Label(row, text=suffix, foreground="gray").pack(side=tk.LEFT,
+                                                               padx=4)
+        self.drivetrain_label = ttk.Label(mf, text="", justify=tk.LEFT,
+                                          foreground="#1F618D")
+        self.drivetrain_label.pack(anchor=tk.W, padx=4, pady=(4, 2))
+        ttk.Button(mf, text="Apply to brake range and cam", width=30,
+                   command=self._apply_drivetrain).pack(anchor=tk.W, padx=4,
+                                                        pady=(0, 4))
+
         self._labelled_entry(bk, "Range min:", self.cfg_vars["brake_min"],
                              label_width=22, suffix="steps")
         self._labelled_entry(bk, "Range max:", self.cfg_vars["brake_max"],
@@ -1407,6 +1509,36 @@ class DynoApp:
                    command=self._send_all_config).pack(side=tk.LEFT, padx=2)
         ttk.Button(pf, text="Restore Defaults", width=18,
                    command=self._restore_defaults).pack(anchor=tk.W, padx=6, pady=(0, 4))
+
+        sf = ttk.LabelFrame(pf, text="Software")
+        sf.pack(fill=tk.X, padx=6, pady=(6, 4))
+        vrow = ttk.Frame(sf)
+        vrow.pack(fill=tk.X, padx=4, pady=2)
+        ttk.Label(vrow, text="Interface:", width=12,
+                  anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(vrow, text=UI_VERSION).pack(side=tk.LEFT)
+        frow = ttk.Frame(sf)
+        frow.pack(fill=tk.X, padx=4, pady=(0, 2))
+        ttk.Label(frow, text="Firmware:", width=12,
+                  anchor=tk.W).pack(side=tk.LEFT)
+        # Filled in from the board's own VERSION reply, so this is what is
+        # actually running rather than what was last flashed from here.
+        self.fw_version_label = ttk.Label(frow, text="unknown",
+                                          foreground="#B9770E")
+        self.fw_version_label.pack(side=tk.LEFT)
+        self.fw_build_label = ttk.Label(frow, text="", foreground="gray")
+        self.fw_build_label.pack(side=tk.LEFT, padx=6)
+        self.update_btn = ttk.Button(
+            sf, text="Update from GitHub", width=22,
+            state=tk.DISABLED, command=self._update_from_github)
+        self.update_btn.pack(anchor=tk.W, padx=4, pady=(4, 2))
+        ttk.Label(sf, wraplength=380, justify=tk.LEFT, foreground="gray",
+                  text=("Not wired up yet. It will fetch the current interface "
+                        "and firmware from github.com/TheESTest/DIY_Dyno, keep "
+                        "a copy of what is running now, and offer to flash the "
+                        "board - none of which should happen mid-session, so it "
+                        "will refuse while a run is recording.")
+                  ).pack(anchor=tk.W, padx=4, pady=(0, 4))
         ttk.Label(pf, wraplength=380, justify=tk.LEFT, foreground="gray",
                   text=("Settings are remembered between sessions automatically - "
                         "reopening the program brings back whatever was on screen "
@@ -1955,6 +2087,105 @@ class DynoApp:
             return
         self._send("RAMPDOWN")
 
+    # ── Drivetrain ───────────────────────────────────────────
+    def _drivetrain(self):
+        """Derived step figures for the current settings, or None if unusable."""
+        try:
+            return drivetrain(float(self.cfg_vars["driver_steps"].get()),
+                              float(self.cfg_vars["gearbox"].get()),
+                              float(self.cfg_vars["cam_angle"].get()),
+                              float(self.cfg_vars["motor_steps"].get()))
+        except ValueError:
+            return None
+
+    def _update_drivetrain(self, *_):
+        """Show what the entered drivetrain works out to, as it is typed."""
+        d = self._drivetrain()
+        if d is None:
+            self.drivetrain_label.config(
+                text="(enter positive numbers to see the derived travel)",
+                foreground="gray")
+            return
+        micro = d.get("microstep_factor")
+        micro_txt = f"{micro:g}x microstepping" if micro else "microstepping unknown"
+        self.drivetrain_label.config(
+            text=(f"{d['per_motor_rev']:g} steps/motor rev  ({micro_txt})\n"
+                  f"{d['per_output_rev']:g} steps per cam revolution"
+                  f"  =  {d['per_degree']:.3f} per degree\n"
+                  f"quarter cam turn = {d['quarter_output_turn']:g} steps"
+                  f"   |   {self.cfg_vars['cam_angle'].get()} deg of cam ="
+                  f" {d['cam_travel']:.0f} steps"),
+            foreground="#1F618D")
+
+    def _apply_drivetrain(self):
+        """Put the derived travel into the brake range and the cam scale.
+
+        Gains and speeds are offered for rescaling at the same time: Kp is
+        microsteps of brake per RPM of error, so changing the step scale
+        without changing them leaves the loop wrong by exactly that factor -
+        and too high means the brake slams on for a small error.
+        """
+        d = self._drivetrain()
+        if d is None:
+            messagebox.showerror("Drivetrain", "Enter positive numbers first.")
+            return
+        try:
+            old_travel = float(self.cfg_vars["brake_max"].get())
+        except ValueError:
+            old_travel = 0.0
+        new_travel = round(d["cam_travel"])
+        factor = (new_travel / old_travel) if old_travel > 0 else 0.0
+
+        msg = (f"Brake range max becomes {new_travel:g} steps "
+               f"(was {old_travel:g}), and the cam scale "
+               f"{d['per_degree']:.3f} steps per degree.")
+        rescale = False
+        if factor > 0 and abs(factor - 1.0) > 0.01:
+            rescale = messagebox.askyesno(
+                "Rescale gains and speeds too?",
+                msg + f"\n\nThat is a factor of {factor:.4g}.\n\n"
+                "PID gains are microsteps of brake per RPM of error, so they "
+                "belong to the old step scale. Leaving them alone would make "
+                "the loop wrong by that same factor"
+                + (" - far too strong, which means the brake slams on for a "
+                   "small error." if factor < 1 else " - far too weak to "
+                   "control with.") +
+                "\n\nRescale the PID gains, speed and acceleration by "
+                f"{factor:.4g} as well?")
+        else:
+            messagebox.showinfo("Drivetrain", msg)
+
+        self.cfg_vars["brake_max"].set(str(new_travel))
+        self.cfg_vars["cam_spd"].set(f"{d['per_degree']:.4f}")
+
+        if rescale:
+            for store, keys in ((self.pid_vars, ("kp", "ki", "kd")),
+                                (self.pid_sweep_vars, ("kp", "ki", "kd"))):
+                for k in keys:
+                    try:
+                        store[k].set(f"{float(store[k].get()) * factor:.6g}")
+                    except (KeyError, ValueError):
+                        pass
+            for k in ("step_speed", "step_accel"):
+                try:
+                    self.cfg_vars[k].set(
+                        f"{float(self.cfg_vars[k].get()) * factor:.6g}")
+                except ValueError:
+                    pass
+            self._log_event(
+                f"Drivetrain applied: travel {old_travel:g} -> {new_travel:g}, "
+                f"gains and speeds rescaled by {factor:.4g}", "ack")
+        else:
+            self._log_event(
+                f"Drivetrain applied: travel {old_travel:g} -> {new_travel:g}, "
+                "gains and speeds left alone", "ack")
+
+        self._update_drivetrain()
+        if self.ser and self.ser.is_open:
+            self._send_brake_cfg()
+            self._send_cam_cfg()
+            self._apply_pid()
+
     def _send_brake_cfg(self):
         self._send(f"BRAKE_RANGE,{self.cfg_vars['brake_min'].get()},"
                    f"{self.cfg_vars['brake_max'].get()}")
@@ -2187,6 +2418,19 @@ class DynoApp:
             self._session_written = snap
         except OSError:
             pass                    # never let this interrupt a run
+
+    def _update_from_github(self):
+        """TBD - fetch the current interface and firmware from the repository.
+
+        Deliberately unimplemented rather than half-implemented: pulling code
+        onto the machine that is driving a brake wants a kept copy of what is
+        running, a check that nothing is recording, and a deliberate flash
+        step. The button stays disabled until all three exist.
+        """
+        messagebox.showinfo(
+            "Not available yet",
+            "Updating from the repository is not implemented yet.\n\n"
+            "For now, copy dyno_gui.py across and flash the firmware by hand.")
 
     def _restore_defaults(self):
         if not messagebox.askyesno(
@@ -2985,6 +3229,12 @@ class DynoApp:
         self.status_labels["fw_version"].config(
             text=self.fw_version,
             foreground=("#B9770E" if self.fw_version == "unknown" else "black"))
+        # Same figure on the settings page, where it is next to the interface
+        # version it has to agree with.
+        self.fw_version_label.config(
+            text=self.fw_version,
+            foreground=("#B9770E" if self.fw_version == "unknown" else "black"))
+        self.fw_build_label.config(text=self.fw_build)
         # Reads 'not installed' until a board reports a live encoder, so the
         # panel never implies a measurement that is not being taken.
         if d.get("enc_ok"):
