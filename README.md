@@ -6,8 +6,8 @@ a stepper-actuated hydraulic brake.
 
 | Component | Version | Location |
 |---|---|---|
-| Raspberry Pi UI | 1.8.0 | [`pi_gui/`](pi_gui/) |
-| ESP32-S3 firmware | 1.6.1 | [`esp32_firmware/`](esp32_firmware/) |
+| Raspberry Pi UI | 1.9.0 | [`pi_gui/`](pi_gui/) |
+| ESP32-S3 firmware | 1.7.0 | [`esp32_firmware/`](esp32_firmware/) |
 
 Both versions are recorded in the `_conditions.json` file saved beside every
 run, so a result can be traced back to the code that produced it. The UI shows

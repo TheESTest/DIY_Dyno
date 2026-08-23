@@ -155,7 +155,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.8.0"
+UI_VERSION = "1.9.0"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at
@@ -293,6 +293,11 @@ class DynoApp:
         # as a talking controller: the port stays open after the board resets
         # or is unplugged, and every reading then silently reads zero.
         self._last_data_at = None
+        # Raw pulse capture. Held in memory for the few seconds it runs and
+        # then written out - a diagnostic, not part of a normal run.
+        self._pulses = []
+        self._pulse_active = False
+        self._pulse_ppr = 3
 
         # Readiness flags (from ESP). "sim" starts True so an unknown board is
         # treated as suspect until it tells us otherwise — the safe default is
@@ -381,6 +386,7 @@ class DynoApp:
             "rpm_extrap_max": tk.StringVar(value="5"),
             "rpm_source":     tk.StringVar(value=RPM_SOURCES[1]),
             "rpm_count_ms":   tk.StringVar(value="100"),
+            "pulse_secs":     tk.StringVar(value="10"),
             # Brake sweep stall watch
             "char_stop_on_stall": tk.BooleanVar(value=False),
             # Stepper encoder - hardware not fitted yet, see the TBD panel
@@ -1364,6 +1370,26 @@ class DynoApp:
             "write", lambda *a: self._update_count_window())
         self.count_window_label = ttk.Label(tw, text="", foreground="gray")
         self.count_window_label.pack(anchor=tk.W, padx=(26, 4))
+
+        prow = ttk.Frame(tw)
+        prow.pack(fill=tk.X, padx=4, pady=(6, 1))
+        ttk.Button(prow, text="Capture raw pulses", width=20,
+                   command=self._start_pulse_capture).pack(side=tk.LEFT)
+        ttk.Entry(prow, textvariable=self.cfg_vars["pulse_secs"],
+                  width=5).pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Label(prow, text="seconds").pack(side=tk.LEFT)
+        self.pulse_status = ttk.Label(tw, text="", foreground="gray",
+                                      wraplength=380, justify=tk.LEFT)
+        self.pulse_status.pack(anchor=tk.W, padx=(26, 4))
+        ttk.Label(tw, wraplength=380, justify=tk.LEFT, foreground="gray",
+                  text=("Streams every edge the interrupt sees, accepted or "
+                        "rejected, with its timestamp. A missed tooth is "
+                        "invisible in an averaged reading - it just looks "
+                        "like a slower engine - but in the raw intervals it "
+                        "is a gap at a whole multiple of the others. Saved "
+                        "as its own file. Leave it off for normal running: "
+                        "at high RPM it uses most of the serial link.")
+                  ).pack(anchor=tk.W, padx=4, pady=(2, 4))
         ttk.Label(tw, wraplength=380, justify=tk.LEFT, foreground="gray",
                   text=("All three are measured and saved on every run, so they "
                         "can be compared on the same data rather than across two "
@@ -2044,6 +2070,141 @@ class DynoApp:
             self._log_event(
                 f"Effective range {res['takeup_steps']:.0f}-"
                 f"{res['saturation_steps']:.0f} found but not applied", "ack")
+
+    # ── Raw pulse capture ────────────────────────────────────
+    @staticmethod
+    def pulse_report(pulses, ppr):
+        """What a raw capture says about the pickup.
+
+        A dropped tooth cannot be seen in an averaged reading - it just looks
+        like a slower engine. In the raw intervals it is unmistakable: a gap
+        close to a whole multiple of the ones around it.
+        """
+        acc = [p for p in pulses if p[2] == 1]
+        rej = [p for p in pulses if p[2] == 0]
+        if len(acc) < 10:
+            return {"usable": False,
+                    "reason": f"only {len(acc)} accepted pulses captured"}
+        iv = [p[1] for p in acc[1:]]        # the first interval spans the start
+        srt = sorted(iv)
+        med = srt[len(srt) // 2]
+        if med <= 0:
+            return {"usable": False, "reason": "intervals are not usable"}
+        # Gaps near a whole multiple of the median are missed teeth. Anything
+        # else is just the engine changing speed.
+        dropped, multiples = 0, {}
+        for v in iv:
+            r = v / med
+            n = int(round(r))
+            if n >= 2 and abs(r - n) < 0.15:
+                dropped += n - 1
+                multiples[n] = multiples.get(n, 0) + 1
+        span_s = (acc[-1][0] - acc[0][0]) / 1e6 if len(acc) > 1 else 0.0
+        expected = len(acc) + dropped
+        lo = srt[int(len(srt) * 0.1)]
+        hi = srt[int(len(srt) * 0.9)]
+        return {
+            "usable": True,
+            "captured": len(pulses),
+            "accepted": len(acc),
+            "rejected": len(rej),
+            "seconds": span_s,
+            "median_interval_us": med,
+            "rpm_from_median": 60e6 / (med * ppr) if med else 0.0,
+            "dropped_estimate": dropped,
+            "dropout_pct": 100.0 * dropped / expected if expected else 0.0,
+            "multiples": multiples,
+            "jitter_pct": 100.0 * (hi - lo) / med if med else 0.0,
+        }
+
+    def _start_pulse_capture(self):
+        """Ask the board to stream every raw edge for a few seconds."""
+        if not (self.ser and self.ser.is_open):
+            messagebox.showinfo("Not connected", "Connect to the ESP32 first.")
+            return
+        if not self._telemetry_is_live():
+            messagebox.showerror(
+                "No data from the controller",
+                "No readings are arriving, so a capture would be empty.")
+            return
+        try:
+            secs = int(self.cfg_vars["pulse_secs"].get())
+        except ValueError:
+            messagebox.showerror("Capture", "Enter a whole number of seconds.")
+            return
+        if not 1 <= secs <= 60:
+            messagebox.showerror("Capture", "Capture must be 1 to 60 seconds.")
+            return
+        self._pulses = []
+        self.pulse_status.config(text=f"capturing for {secs} s...",
+                                 foreground="gray")
+        self._send(f"PULSELOG,{secs}")
+
+    def _finish_pulse_capture(self, done_line):
+        # Cleared here as well as on the DONE line, so the flag cannot be
+        # left set if this is reached any other way.
+        self._pulse_active = False
+        rep = self.pulse_report(self._pulses, self._pulse_ppr)
+        lost = 0
+        bits = done_line.split(",")
+        if len(bits) >= 3:
+            try:
+                lost = int(bits[2])
+            except ValueError:
+                pass
+        if not rep.get("usable"):
+            self.pulse_status.config(
+                text=f"nothing usable: {rep.get('reason', '')}",
+                foreground="#B03A2E")
+            return
+
+        folder = self.cfg_vars["data_dir"].get().strip() or DEFAULT_DATA_DIR
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(folder, f"pulses_{stamp}.csv")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            med = rep["median_interval_us"]
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["Micros", "Interval_us", "Accepted",
+                            "Implied_RPM", "Multiple_of_median"])
+                for t, dt, ok in self._pulses:
+                    rpm = 60e6 / (dt * self._pulse_ppr) if dt > 0 else 0.0
+                    w.writerow([t, dt, ok, f"{rpm:.1f}",
+                                f"{dt / med:.3f}" if med else ""])
+        except OSError as e:
+            self.pulse_status.config(text=f"save failed: {e}",
+                                     foreground="#B03A2E")
+            return
+
+        txt = (f"{rep['accepted']} pulses in {rep['seconds']:.1f}s, "
+               f"{rep['dropped_estimate']} missed "
+               f"({rep['dropout_pct']:.2f}%), "
+               f"{rep['rejected']} rejected as noise")
+        if lost:
+            txt += f", {lost} lost to a full buffer"
+        self.pulse_status.config(
+            text=txt,
+            foreground=("#B03A2E" if rep["dropout_pct"] > 0.5 else "#1E8449"))
+        self._log_event(
+            f"Pulse capture saved: {os.path.basename(path)} - {txt}", "ack")
+        detail = ""
+        if rep["multiples"]:
+            detail = (NL + NL + "Gaps found at: " + ", ".join(
+                f"{n}x median ({c} times)"
+                for n, c in sorted(rep["multiples"].items())))
+        messagebox.showinfo(
+            "Pulse capture complete",
+            f"{rep['accepted']} accepted pulses over {rep['seconds']:.1f} s."
+            + NL +
+            f"Median interval {rep['median_interval_us']} us "
+            f"= {rep['rpm_from_median']:.0f} RPM." + NL +
+            f"Interval spread, 10th to 90th percentile: "
+            f"{rep['jitter_pct']:.1f}%." + NL + NL +
+            f"Estimated missed teeth: {rep['dropped_estimate']} "
+            f"({rep['dropout_pct']:.2f}% of what should have arrived)." + NL +
+            f"Edges rejected as noise: {rep['rejected']}."
+            + detail + NL + NL + f"Saved to:" + NL + f"{path}")
 
     def _abort_brake_char(self, why):
         self._char_active = False
@@ -3549,6 +3710,27 @@ class DynoApp:
             self._log_event(f"ERR  {msg}", "err")
 
         # ---- Config replies to STATUS ----
+        elif line.startswith("P,"):
+            # P,<micros>,<interval_us>,<1 accepted|0 rejected>
+            b = line.split(",")
+            if len(b) >= 4:
+                try:
+                    self._pulses.append((int(b[1]), int(b[2]), int(b[3])))
+                except ValueError:
+                    pass
+        elif line.startswith("PULSELOG_START,"):
+            b = line.split(",")
+            self._pulses = []
+            self._pulse_active = True
+            try:
+                self._pulse_ppr = int(b[2])
+            except (IndexError, ValueError):
+                pass
+            self._log_event(line, "ack")
+        elif line.startswith("PULSELOG_DONE,"):
+            self._pulse_active = False
+            self._log_event(line, "ack")
+            self.root.after(0, lambda l=line: self._finish_pulse_capture(l))
         elif line.startswith("CFG,"):
             if line.startswith("CFG,FW_VERSION,"):
                 bits = line.split(",")

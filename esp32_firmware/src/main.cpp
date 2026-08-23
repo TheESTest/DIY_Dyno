@@ -30,6 +30,9 @@
 //             RPM_EXTRAP,<0|1>,<points>,<maxrun>
 //             RPM_SOURCE,<0 gap|1 counted|2 revolution>
 //             RPM_COUNT_MS,<ms>  counting window length
+//             PULSELOG,<seconds> stream every raw edge, 0 stops
+//   Emits:    P,<micros>,<interval_us>,<1 accepted|0 rejected>
+//             PULSELOG_DONE,<emitted>,<lost to a full ring>
 //             RPM_SLEW,<rpm/s>  RPM_AVG,<n>  TACH_RESET
 //             RAMPDOWN_MODE,<0-2>  RAMPDOWN_RATE,<rpm/s>  RAMPDOWN_BRAKE,<%/s>
 //             CUTOFF_RPM,<rpm>  THROTTLE_OFF,<pct>  RAMPDOWN  STOP_RATE,<%/s>
@@ -71,7 +74,7 @@
 // Firmware version. Bump the minor when the serial protocol changes shape
 // (a new DATA field, a renamed command) so a mismatched GUI is diagnosable
 // from the log rather than from guesswork about which build is on the board.
-#define FW_VERSION "1.6.1"
+#define FW_VERSION "1.7.0"
 
 // ─────────────────────────────────────────────────────────────────────
 // STEPPER ENCODER - TBD, HARDWARE NOT FITTED
@@ -264,6 +267,44 @@ volatile uint32_t pulseIntervalUs = 0;
 // cancels tooth-to-tooth spacing error outright, which timing a single
 // gap cannot: an unevenly spaced tooth shows up as a fixed pattern that
 // no amount of averaging removes, it only smears.
+// Raw pulse capture. Every edge the interrupt sees is queued here with its
+// timestamp, accepted or rejected, and streamed out so the actual pulse
+// train can be examined rather than inferred from an averaged reading at
+// 20 Hz. A dropped tooth shows up as an interval near a whole multiple of
+// the others, which no amount of downstream filtering can reveal.
+//
+// Time bounded on purpose: at 6000 RPM on three teeth this is about 80% of
+// a 115200 link once DATA is sharing it, so it is a diagnostic to switch on
+// for a few seconds, not something to leave running.
+#define PULSE_LOG_MAX 256          // ring entries, drained in loop()
+#define PULSE_LOG_MAX_S 60
+struct PulseEvent {
+    uint32_t t;                    // micros() at the edge
+    uint32_t dt;                   // since the previous accepted edge
+    uint8_t  accepted;             // 0 = thrown out by the glitch gate
+};
+volatile PulseEvent pulseLog[PULSE_LOG_MAX];
+volatile uint16_t pulseLogHead = 0;   // written by the ISR
+volatile uint16_t pulseLogTail = 0;   // read by loop()
+volatile uint32_t pulseLogLost = 0;   // ring full, event discarded
+volatile bool     pulseLogOn   = false;
+uint32_t pulseLogUntilMs = 0;
+uint32_t pulseLogSent    = 0;
+
+// Queue one edge. Called from the ISR, so it only touches the ring.
+static inline void IRAM_ATTR logPulse(uint32_t t, uint32_t dt, bool accepted) {
+    if (!pulseLogOn) return;
+    uint16_t next = (uint16_t)((pulseLogHead + 1) % PULSE_LOG_MAX);
+    if (next == pulseLogTail) {    // full - count it rather than overwrite,
+        pulseLogLost++;            // so a gap in the capture is never silent
+        return;
+    }
+    pulseLog[pulseLogHead].t        = t;
+    pulseLog[pulseLogHead].dt       = dt;
+    pulseLog[pulseLogHead].accepted = accepted ? 1 : 0;
+    pulseLogHead = next;
+}
+
 #define PULSE_TS_MAX 64
 volatile uint32_t pulseTs[PULSE_TS_MAX] = {0};
 volatile uint8_t  pulseTsIdx = 0;
@@ -517,8 +558,10 @@ void IRAM_ATTR onProximityPulse() {
         // burst of noise cannot walk the reference forward one glitch at a
         // time and fabricate a plausible-looking pulse train.
         tachGlitches++;
+        logPulse(now, dt, false);
         return;
     }
+    logPulse(now, dt, true);
     pulseIntervalUs = dt;
     lastPulseUs = now;
     pulseCount++;
@@ -635,6 +678,31 @@ static uint32_t lastSeenPulse   = 0;
 // teeth in a 100 ms window, which a control loop would chase. The window
 // then only sets how often the reading updates and how many pulses it
 // averages over, which is what it is actually for.
+// Empty the pulse ring onto the serial link. Kept out of the ISR: printing
+// from an interrupt would block it for as long as the UART takes.
+static void drainPulseLog() {
+    if (pulseLogOn && pulseLogUntilMs && millis() > pulseLogUntilMs) {
+        pulseLogOn = false;
+    }
+    // Keep draining after it stops, so the tail of the capture is not lost.
+    uint8_t budget = 12;           // per loop pass, so DATA still gets out
+    while (budget-- && pulseLogTail != pulseLogHead) {
+        PulseEvent e;
+        noInterrupts();
+        e = *(PulseEvent *)&pulseLog[pulseLogTail];
+        pulseLogTail = (uint16_t)((pulseLogTail + 1) % PULSE_LOG_MAX);
+        interrupts();
+        Serial.printf("P,%lu,%lu,%u\n", (unsigned long)e.t,
+                      (unsigned long)e.dt, (unsigned)e.accepted);
+        pulseLogSent++;
+    }
+    if (!pulseLogOn && pulseLogUntilMs && pulseLogTail == pulseLogHead) {
+        pulseLogUntilMs = 0;
+        Serial.printf("PULSELOG_DONE,%lu,%lu\n",
+                      (unsigned long)pulseLogSent, (unsigned long)pulseLogLost);
+    }
+}
+
 static void updateRPMCounted() {
     uint32_t nowMs = millis();
     if (countWindowMs == 0) {
@@ -1474,6 +1542,29 @@ static void processCommand(const char* cmd) {
         extrapRun = 0;
         return;
     }
+    // PULSELOG,<seconds> - stream every edge for a while. 0 stops it.
+    if (s.startsWith("PULSELOG,")) {
+        long secs = s.substring(9).toInt();
+        if (secs < 0 || secs > PULSE_LOG_MAX_S) {
+            Serial.printf("ERR,PULSELOG must be 0-%d seconds\n",
+                          PULSE_LOG_MAX_S);
+            return;
+        }
+        noInterrupts();
+        pulseLogHead = pulseLogTail = 0;
+        pulseLogLost = 0;
+        pulseLogOn = (secs > 0);
+        interrupts();
+        pulseLogSent = 0;
+        pulseLogUntilMs = (secs > 0) ? (millis() + (uint32_t)secs * 1000UL) : 0;
+        if (secs > 0) {
+            Serial.printf("PULSELOG_START,%ld,%u\n", secs,
+                          (unsigned)pulsesPerRev);
+        } else {
+            Serial.println("PULSELOG_DONE,0,0");
+        }
+        return;
+    }
     // RPM_COUNT_MS,<ms> - how long each counting window lasts
     if (s.startsWith("RPM_COUNT_MS,")) {
         long v = s.substring(13).toInt();
@@ -1742,6 +1833,8 @@ static void processCommand(const char* cmd) {
         Serial.printf("CFG,RPM_SOURCE,%u\n", (unsigned)rpmSource);
         Serial.printf("CFG,RPM_COUNT_MS,%lu\n",
                        (unsigned long)rpmCountWindowMs);
+        Serial.printf("CFG,PULSELOG,%d,%lu\n", pulseLogOn ? 1 : 0,
+                       (unsigned long)pulseLogLost);
         Serial.printf("CFG,RPM_MEDIAN,%u\n", (unsigned)rpmMedianN);
         Serial.printf("CFG,RPM_EXTRAP,%d,%u,%u\n", rpmExtrapOn ? 1 : 0,
                        (unsigned)rpmExtrapN, (unsigned)rpmExtrapMax);
@@ -2246,6 +2339,7 @@ void loop() {
     } else {
         updateRPM();
     updateRPMCounted();
+    drainPulseLog();
     updateEncoder();
         lastSimUs = 0;                           // reset dt baseline for next SIM entry
     }
