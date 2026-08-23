@@ -155,7 +155,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.9.0"
+UI_VERSION = "1.10.0"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at
@@ -461,6 +461,7 @@ class DynoApp:
         # default values to drift out of step with the real ones.
         self._update_drivetrain()
         self._update_count_window()
+        self._update_gain_meaning()
         self._factory_defaults = self._profile_snapshot()
         self._session_written = None
         self._char_active = False
@@ -955,6 +956,21 @@ class DynoApp:
             self.pid_sweep_vars[key] = sv
             ttk.Entry(row, textvariable=hv, width=8).pack(side=tk.LEFT, padx=1)
             ttk.Entry(row, textvariable=sv, width=8).pack(side=tk.LEFT, padx=1)
+
+        # Kp is steps of brake per RPM of error, which is not a number anyone
+        # can judge by eye. Saying how much error it takes to reach full brake
+        # makes a gain that no longer matches the travel obvious at a glance -
+        # a rescaled gain can be off by a factor of fifty and still look
+        # like a plausible number.
+        self.gain_meaning = ttk.Label(pidf, text="", foreground="gray",
+                                      wraplength=320, justify=tk.LEFT)
+        self.gain_meaning.pack(anchor=tk.W, padx=4)
+        for _v in (self.pid_vars, self.pid_sweep_vars):
+            for _k in ("kp",):
+                _v[_k].trace_add("write", lambda *a: self._update_gain_meaning())
+        for _k in ("brake_min", "brake_max"):
+            self.cfg_vars[_k].trace_add(
+                "write", lambda *a: self._update_gain_meaning())
 
         ttk.Button(pidf, text="Apply PID", command=self._apply_pid).pack(padx=4, pady=4)
 
@@ -4433,6 +4449,51 @@ class DynoApp:
 
     def _on_stop(self):
         self._send("STOP")
+
+    def _update_gain_meaning(self, *_):
+        """Translate Kp into the error it takes to reach full brake.
+
+        The travel it is measured against is the configured brake range, so a
+        gain left behind by a drivetrain change shows up here immediately
+        rather than as a brake that will not move on the stand.
+        """
+        try:
+            lo = float(self.cfg_vars["brake_min"].get())
+            hi = float(self.cfg_vars["brake_max"].get())
+            kp_hold = float(self.pid_vars["kp"].get())
+            kp_sweep = float(self.pid_sweep_vars["kp"].get())
+        except (ValueError, KeyError):
+            self.gain_meaning.config(text="", foreground="gray")
+            return
+        span = hi - lo
+        if span <= 0 or kp_hold <= 0:
+            self.gain_meaning.config(
+                text="(set a brake range and a positive Kp)", foreground="gray")
+            return
+        e_hold = span / kp_hold
+        e_sweep = span / kp_sweep if kp_sweep > 0 else float("inf")
+        txt = (f"Kp {kp_hold:g} over {span:.0f} steps = full brake at "
+               f"{e_hold:,.0f} RPM of error")
+        if kp_sweep > 0:
+            txt += f"  (sweep: {e_sweep:,.0f})"
+        colour = "gray"
+        # Beyond a few thousand RPM of error the loop has no authority at all;
+        # below a hundred it is effectively on/off.
+        if e_hold > 3000:
+            txt += "  - far too weak, the brake will barely move"
+            colour = "#B03A2E"
+        elif e_hold < 100:
+            txt += "  - very stiff, close to on/off"
+            colour = "#B03A2E"
+        try:
+            if float(self.pid_vars["ki"].get()) == 0.0:
+                txt += ("\nKi is zero: steady error will never be removed, and "
+                        "any dead travel before the pads bite cannot be walked "
+                        "out.")
+                colour = "#B9770E" if colour == "gray" else colour
+        except (ValueError, KeyError):
+            pass
+        self.gain_meaning.config(text=txt, foreground=colour)
 
     def _apply_pid(self):
         h, s = self.pid_vars, self.pid_sweep_vars
