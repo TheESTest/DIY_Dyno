@@ -197,6 +197,63 @@ try:
     shown.clear(); app._flash_downloaded_firmware()
     check("will not flash without a port",
           any("port" in s[1].lower() for s in shown), True)
+
+    # ── a flash that actually runs, with esptool faked ────────────────────
+    # Every other flash case here stops at a guard, so nothing reached the end
+    # of a successful flash - which is where a stale message was still living.
+    import subprocess as _sp
+    class _Done:
+        returncode = 0
+        stdout = ("Wrote 337312 bytes" + chr(10)
+                  + "Hash of data verified." + chr(10))
+        stderr = ""
+    class _Failed:
+        returncode = 2
+        stdout = ""
+        stderr = "A fatal error occurred: could not open port"
+    real_run = _sp.run
+    calls = []
+    dyno_gui.subprocess.run = lambda cmd, **k: (calls.append(cmd), _Done())[1]
+    os.makedirs(os.path.join(work, "fw_new"), exist_ok=True)
+    with open(os.path.join(work, "fw_new", "firmware.bin"), "wb") as f:
+        f.write(bytes(16))
+    app.ser = None
+    app.recording = False
+    app.port_var.set("/dev/ttyUSB0")
+    shown.clear(); calls.clear()
+    app._flash_downloaded_firmware()
+    check("flash reported as done", any("Flashed" == x[1] for x in shown), True)
+    check("esptool actually invoked", bool(calls), True)
+    check("wrote to the right offset", "0x10000" in calls[0], True)
+    check("used the port that was chosen", "/dev/ttyUSB0" in calls[0], True)
+    check("told the operator to re-send settings",
+          any("Send all" in x[2] for x in shown), True)
+    # nothing left over from the old placeholder
+    check("no stale placeholder message",
+          any("not implemented" in x[2].lower() for x in shown), False)
+    check("exactly one dialog after confirming",
+          len([x for x in shown if x[0] != "ASK"]), 1)
+
+    # a failing esptool is reported, not silently treated as success
+    dyno_gui.subprocess.run = lambda cmd, **k: _Failed()
+    shown.clear()
+    app._flash_downloaded_firmware()
+    check("a failed flash is reported",
+          any(x[0] == "error" for x in shown), True)
+    check("and shows what esptool said",
+          any("could not open port" in x[2] for x in shown), True)
+    # exit 0 but no verification line must not count as success
+    class _NoHash:
+        returncode = 0
+        stdout = "Wrote 337312 bytes" + chr(10)
+        stderr = ""
+    dyno_gui.subprocess.run = lambda cmd, **k: _NoHash()
+    shown.clear()
+    app._flash_downloaded_firmware()
+    check("unverified write is not called success",
+          any(x[0] == "error" for x in shown), True)
+    dyno_gui.subprocess.run = real_run
+
 finally:
     dyno_gui.__file__ = orig_file
     shutil.rmtree(work, ignore_errors=True)

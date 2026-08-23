@@ -148,7 +148,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.5.1"
+UI_VERSION = "1.5.2"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at
@@ -2802,19 +2802,6 @@ class DynoApp:
             tail = (out.stderr or out.stdout or "")[-600:]
             messagebox.showerror("Flash failed",
                                  f"esptool exited {out.returncode}:\n\n{tail}")
-
-
-        """TBD - fetch the current interface and firmware from the repository.
-
-        Deliberately unimplemented rather than half-implemented: pulling code
-        onto the machine that is driving a brake wants a kept copy of what is
-        running, a check that nothing is recording, and a deliberate flash
-        step. The button stays disabled until all three exist.
-        """
-        messagebox.showinfo(
-            "Not available yet",
-            "Updating from the repository is not implemented yet.\n\n"
-            "For now, copy dyno_gui.py across and flash the firmware by hand.")
 
     def _restore_defaults(self):
         if not messagebox.askyesno(
