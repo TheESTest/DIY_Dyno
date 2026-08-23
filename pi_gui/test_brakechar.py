@@ -31,6 +31,9 @@ import time as _time
 move={"from":0.0,"to":0.0,"t0":0.0,"secs":0.0}
 
 def _apply(pos):
+    # Frames arriving is part of what a working controller does, and the sweep
+    # now refuses to run without them.
+    app._last_data_at = _time.monotonic()
     over=max(0.0, pos-TAKEUP)
     psi = over*0.30
     if app._char_rows and app._char_rows[-1][1]=="down":
@@ -64,7 +67,7 @@ app._send=fake_send
 # ---- guards ----
 app.ser=None; app._start_brake_char()
 check("refuses while disconnected", app._char_active, False)
-app.ser=FakeSer(); app.ready_flags["homed"]=False
+app.ser=FakeSer(); app._last_data_at=_time.monotonic(); app.ready_flags["homed"]=False
 app._start_brake_char()
 check("refuses when not homed", app._char_active, False)
 app.ready_flags["homed"]=True
@@ -94,6 +97,7 @@ try:
     app.cfg_vars["data_dir"].set(tmp)
     dyno_gui.CHAR_UP_S, dyno_gui.CHAR_HOLD_S, dyno_gui.CHAR_DOWN_S = 1.0, 0.2, 1.0
     messagebox.askyesno=lambda *a,**k: True
+    app._last_data_at = _time.monotonic()
     app._start_brake_char()
     check("sweep started", app._char_active, True)
     import time as _t

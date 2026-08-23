@@ -41,6 +41,7 @@ app.root.after = lambda ms, fn=None, *a: None      # stop it rescheduling itself
 for step in range(int((dyno_gui.CHAR_UP_S + dyno_gui.CHAR_HOLD_S
                        + dyno_gui.CHAR_DOWN_S) / 0.05) + 4):
     app._char_t0 = _time.monotonic() - step * 0.05
+    app._last_data_at = _time.monotonic()      # a live controller, faked
     if not app._char_active:
         break
     app._char_tick()

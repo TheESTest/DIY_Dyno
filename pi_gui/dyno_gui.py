@@ -70,6 +70,13 @@ EVENT_LOG_LINES = 400
 # this rig they address different things: a ~2500 Hz electrical burst on the
 # pickup (gate 1), the odd isolated bad interval (gate 2), and residue (3, 4).
 RPM_MEDIAN_WINDOWS = ["1 (off)", "3", "5", "7"]
+# The same tach, measured three ways. All are recorded on every run; this
+# only chooses which one the control loop is given.
+RPM_SOURCES = [
+    "0 - gap between pulses",
+    "1 - pulses counted per window",
+    "2 - one whole revolution",
+]
 
 # How stepper position translates into actual brake application. The pusher is
 # cam driven, so these are not the same thing except in the linear case.
@@ -148,7 +155,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.5.2"
+UI_VERSION = "1.8.0"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at
@@ -270,6 +277,7 @@ class DynoApp:
             "brake_pct": 0.0, "press_psi": 0.0, "faults": 0,
             "press_mv": 0.0, "spare_aux": 0.0, "glitches": 0,
             "estimated": 0, "enc_pos": 0, "enc_ok": 0,
+            "rpm_counted": 0.0, "rpm_rev": 0.0,
         }
         # What the board says it is running. Unknown until it answers, and
         # firmware old enough not to report one leaves it that way.
@@ -281,6 +289,10 @@ class DynoApp:
         # about a run it was never written for.
         self._notes_edited = None
         self._run_started = None       # when the current recording began
+        # When a DATA frame last arrived. An open serial port is not the same
+        # as a talking controller: the port stays open after the board resets
+        # or is unplugged, and every reading then silently reads zero.
+        self._last_data_at = None
 
         # Readiness flags (from ESP). "sim" starts True so an unknown board is
         # treated as suspect until it tells us otherwise — the safe default is
@@ -367,6 +379,8 @@ class DynoApp:
             "rpm_extrap":     tk.BooleanVar(value=False),
             "rpm_extrap_n":   tk.StringVar(value="4"),
             "rpm_extrap_max": tk.StringVar(value="5"),
+            "rpm_source":     tk.StringVar(value=RPM_SOURCES[1]),
+            "rpm_count_ms":   tk.StringVar(value="100"),
             # Brake sweep stall watch
             "char_stop_on_stall": tk.BooleanVar(value=False),
             # Stepper encoder - hardware not fitted yet, see the TBD panel
@@ -440,6 +454,7 @@ class DynoApp:
         # what Restore Defaults puts back, so there is no second copy of the
         # default values to drift out of step with the real ones.
         self._update_drivetrain()
+        self._update_count_window()
         self._factory_defaults = self._profile_snapshot()
         self._session_written = None
         self._char_active = False
@@ -447,6 +462,7 @@ class DynoApp:
         self._char_home = 0
         self._char_hi = 0.0
         self._char_phase_sent = None
+        self._char_range = None
         self._char_engaged = False
         self._char_base_psi = None
         self._char_susp_since = None
@@ -1066,6 +1082,8 @@ class DynoApp:
             ("State",       "state",      "IDLE"),
             ("Tach glitches","glitches",  "0"),
             ("RPM estimated","estimated", "0"),
+            ("RPM counted",  "rpm_counted","0"),
+            ("RPM one rev",  "rpm_rev",   "0"),
             ("Firmware",     "fw_version","unknown"),
             ("Load mV",     "load_raw",   "0.0"),
             ("Load net mV", "load_net",   "--"),
@@ -1327,6 +1345,36 @@ class DynoApp:
         # the lag in seconds makes the cost visible where the choice is made.
         self.rpm_lag_label = ttk.Label(tw, text="", foreground="gray")
         self.rpm_lag_label.pack(anchor=tk.W, padx=(26, 4))
+
+        srow = ttk.Frame(tw)
+        srow.pack(fill=tk.X, padx=4, pady=(4, 1))
+        ttk.Label(srow, text="Drive the loop from:", width=22,
+                  anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Combobox(srow, textvariable=self.cfg_vars["rpm_source"], width=24,
+                     values=RPM_SOURCES, state="readonly").pack(side=tk.LEFT)
+
+        wrow = ttk.Frame(tw)
+        wrow.pack(fill=tk.X, padx=4, pady=1)
+        ttk.Label(wrow, text="Counting window:", width=22,
+                  anchor=tk.W).pack(side=tk.LEFT)
+        e = ttk.Entry(wrow, textvariable=self.cfg_vars["rpm_count_ms"], width=8)
+        e.pack(side=tk.LEFT)
+        ttk.Label(wrow, text="ms").pack(side=tk.LEFT, padx=3)
+        self.cfg_vars["rpm_count_ms"].trace_add(
+            "write", lambda *a: self._update_count_window())
+        self.count_window_label = ttk.Label(tw, text="", foreground="gray")
+        self.count_window_label.pack(anchor=tk.W, padx=(26, 4))
+        ttk.Label(tw, wraplength=380, justify=tk.LEFT, foreground="gray",
+                  text=("All three are measured and saved on every run, so they "
+                        "can be compared on the same data rather than across two "
+                        "runs. Gap timing answers fastest but carries any error "
+                        "in tooth spacing straight through. Counting is immune to "
+                        "spacing and to a single bad edge, but is coarse - about "
+                        "80 RPM of quantisation at 1500 on three teeth. Timing a "
+                        "whole revolution cancels tooth spacing outright and is "
+                        "usually the best of the three on a wheel that is not "
+                        "perfectly machined.")
+                  ).pack(anchor=tk.W, padx=4, pady=(2, 4))
         ttk.Label(tw, wraplength=380, justify=tk.LEFT, foreground="gray",
                   text=("The band is the important one: a reading outside it is "
                         "discarded rather than averaged in, and its upper end also "
@@ -1439,6 +1487,9 @@ class DynoApp:
         self.char_progress.pack(side=tk.LEFT, padx=8)
         self.char_stall_label = ttk.Label(bk, text="", foreground="#B03A2E")
         self.char_stall_label.pack(anchor=tk.W, padx=4)
+        ttk.Button(bk, text="Find effective range from a sweep", width=32,
+                   command=self._find_effective_range).pack(anchor=tk.W,
+                                                            padx=4, pady=(2, 0))
         ttk.Checkbutton(bk, text="Stop the sweep if a stall is suspected",
                         variable=self.cfg_vars["char_stop_on_stall"]).pack(
                             anchor=tk.W, padx=4)
@@ -1686,6 +1737,21 @@ class DynoApp:
         if not (self.ser and self.ser.is_open):
             messagebox.showinfo("Not connected", "Connect to the ESP32 first.")
             return
+        # An open port proves nothing. Without live frames the sweep would
+        # record its own commanded ramp against 21 seconds of zeros and save
+        # it as a calibration, which is worse than refusing.
+        if not self._telemetry_is_live():
+            age = self._telemetry_age_s()
+            messagebox.showerror(
+                "No data from the controller",
+                ("The serial port is open but no readings are arriving"
+                 + (" (last was %.0f s ago)" % age if age is not None
+                    else " (none have arrived at all)") + "." + NL2 +
+                 "The board may have reset, been re-flashed or been "
+                 "unplugged. Reconnect and check the readings are moving "
+                 "before characterising - a sweep run now would record "
+                 "nothing but zeros."))
+            return
         if not self.ready_flags.get("homed"):
             messagebox.showwarning(
                 "Home first",
@@ -1756,6 +1822,11 @@ class DynoApp:
             # 'hold' needs no command: it is already where the leg ends.
         with self._lock:
             d = dict(self.live)
+        if not self._telemetry_is_live(3.0):
+            self._abort_brake_char(
+                "Readings stopped arriving - the rest would be zeros")
+            return
+
         # Only the outward leg: on the way back position falls by design, so
         # the comparison means nothing there.
         stalled = False
@@ -1841,6 +1912,139 @@ class DynoApp:
             self._char_susp_since = None       # pressure moved, not a stall
         return False
 
+    # ── Effective range from a characterisation sweep ────────
+    @staticmethod
+    def effective_range(pos, psi, rise_frac=0.05, top_frac=0.95, min_span=5.0):
+        """Where actuator position actually produces pressure.
+
+        Below the takeup point the linkage is closing up and moving the brake
+        does nothing; above saturation the pressure has stopped answering.
+        Only the span between them is worth giving a control loop, because a
+        loop whose output lands outside it is commanding travel that changes
+        nothing.
+
+        Returns a dict, or one carrying `usable: False` and a reason - a sweep
+        that recorded nothing must say so rather than return a plausible range.
+        """
+        pos = np.asarray(pos, dtype=float)
+        psi = np.asarray(psi, dtype=float)
+        if pos.size < 10 or psi.size != pos.size:
+            return {"usable": False, "reason": "not enough samples"}
+        if float(np.nanmax(pos)) - float(np.nanmin(pos)) < 1.0:
+            return {"usable": False,
+                    "reason": "the actuator never moved - reported position "
+                              "did not change during the sweep"}
+        order = np.argsort(pos)
+        p, q = pos[order], psi[order]
+        # Baseline from the lowest tenth of travel, where nothing should be
+        # happening yet.
+        n0 = max(3, p.size // 10)
+        base = float(np.median(q[:n0]))
+        span = float(np.nanmax(q)) - base
+        if not np.isfinite(span) or span < min_span:
+            return {"usable": False,
+                    "reason": (f"pressure never rose more than {span:.1f} PSI "
+                               "above its baseline - no response to measure")}
+        takeup_at = base + rise_frac * span
+        top_at = base + top_frac * span
+        above = np.flatnonzero(q >= takeup_at)
+        below = np.flatnonzero(q >= top_at)
+        takeup = float(p[above[0]]) if above.size else float(p[0])
+        sat = float(p[below[0]]) if below.size else float(p[-1])
+        if sat <= takeup:
+            return {"usable": False,
+                    "reason": "pressure rose too abruptly to separate takeup "
+                              "from saturation"}
+        active = (p >= takeup) & (p <= sat)
+        slope = (span * (top_frac - rise_frac)) / (sat - takeup)
+        return {
+            "usable": True,
+            "baseline_psi": base,
+            "psi_span": span,
+            "takeup_steps": takeup,
+            "saturation_steps": sat,
+            "effective_span": sat - takeup,
+            "psi_per_step": slope,
+            "dead_below_pct": 100.0 * takeup / max(float(np.nanmax(p)), 1.0),
+            "samples_in_range": int(active.sum()),
+        }
+
+    def _range_from_rows(self, rows):
+        """Effective range from sweep rows, using the outward leg only."""
+        up = [r for r in rows if len(r) > 5 and r[1] == "up"]
+        if len(up) < 10:
+            up = [r for r in rows if len(r) > 5]
+        try:
+            pos = [float(r[3]) for r in up]
+            psi = [float(r[5]) for r in up]
+        except (ValueError, IndexError):
+            return {"usable": False, "reason": "the sweep file could not be read"}
+        return self.effective_range(pos, psi)
+
+    def _find_effective_range(self):
+        """Read a characterisation sweep and offer its range to the brake limits."""
+        path = filedialog.askopenfilename(
+            title="Select a brake characterisation CSV",
+            initialdir=(self.cfg_vars["data_dir"].get().strip() or DEFAULT_DATA_DIR),
+            filetypes=[("Characterisation sweep", "brake_char_*.csv"),
+                       ("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, newline="") as f:
+                rdr = csv.reader(f)
+                header = next(rdr, [])
+                rows = [r for r in rdr]
+        except OSError as e:
+            messagebox.showerror("Could not read it", str(e))
+            return
+        if "Commanded_Steps" not in header:
+            messagebox.showwarning(
+                "Not a sweep file",
+                "That does not look like a brake characterisation sweep.")
+            return
+
+        res = self._range_from_rows(rows)
+        if not res.get("usable"):
+            messagebox.showerror(
+                "No usable range in that file",
+                f"{os.path.basename(path)} does not show the brake responding:"
+                + NL2 + f"  {res.get('reason', 'unknown')}" + NL2 +
+                "Run the sweep again with the controller connected and the "
+                "readings visibly moving, then try again.")
+            self._log_event(
+                f"Effective range: {os.path.basename(path)} unusable - "
+                f"{res.get('reason')}", "err")
+            return
+
+        msg = (f"Takeup at {res['takeup_steps']:.0f} steps - below this the "
+               f"linkage is closing up and pressure does not answer."
+               + NL +
+               f"Saturation at {res['saturation_steps']:.0f} steps - above this "
+               f"pressure has stopped rising."
+               + NL2 +
+               f"Effective span {res['effective_span']:.0f} steps, "
+               f"{res['psi_span']:.0f} PSI of range, "
+               f"{res['psi_per_step']:.2f} PSI per step."
+               + NL +
+               f"{res['dead_below_pct']:.0f}% of travel sits below takeup."
+               + NL2 +
+               "Set the brake range to this, so every step the control loop "
+               "commands actually changes the pressure?")
+        if messagebox.askyesno("Effective range found", msg):
+            self.cfg_vars["brake_min"].set(f"{res['takeup_steps']:.0f}")
+            self.cfg_vars["brake_max"].set(f"{res['saturation_steps']:.0f}")
+            self._log_event(
+                f"Brake range set from {os.path.basename(path)}: "
+                f"{res['takeup_steps']:.0f}-{res['saturation_steps']:.0f} steps",
+                "ack")
+            if self.ser and self.ser.is_open:
+                self._send_brake_cfg()
+        else:
+            self._log_event(
+                f"Effective range {res['takeup_steps']:.0f}-"
+                f"{res['saturation_steps']:.0f} found but not applied", "ack")
+
     def _abort_brake_char(self, why):
         self._char_active = False
         self._send(f"BRAKE,{int(self._char_home)}")
@@ -1874,6 +2078,10 @@ class DynoApp:
             self._log_event(f"Brake characterisation save failed: {e}", "err")
             return
 
+        # The sweep already holds everything needed to work out where the
+        # brake actually responds, so say so here rather than making the
+        # operator re-open the file to find out.
+        self._char_range = self._range_from_rows(rows)
         self.char_progress.config(text=f"Saved brake_char_{stamp}")
         self._log_event(f"Brake characterisation saved: brake_char_{stamp}"
                         f" ({len(rows)} samples)", "ack")
@@ -2083,6 +2291,7 @@ class DynoApp:
         ("rpm_extrap_n",   "Extrapolation fit points", "int", 2, 10),
         ("rpm_extrap_max", "Extrapolation max run",    "int", 1, 50),
         ("rpm_avg",        "Average over",      "int",   1, 500),
+        ("rpm_count_ms",   "Counting window",   "int",   20, 5000),
         ("rpm_slew",       "Slew limit",        "float", 0, None),
     ]
 
@@ -2134,6 +2343,48 @@ class DynoApp:
             problems.append("Ratio gate: not a number")
         return problems
 
+    def _update_count_window(self, *_):
+        """Say what the counting window works out to, as it is typed.
+
+        The window sets how often the reading updates and how many teeth it
+        averages over. Both matter to a control loop, so both are shown rather
+        than leaving the operator to work them out from milliseconds.
+        """
+        try:
+            ms = float(self.cfg_vars["rpm_count_ms"].get())
+            ppr = int(self.cfg_vars["teeth"].get())
+        except ValueError:
+            self.count_window_label.config(
+                text="(enter a window in milliseconds)", foreground="gray")
+            return
+        if ms <= 0 or ppr < 1:
+            self.count_window_label.config(
+                text="(window and pulses per rev must be positive)",
+                foreground="gray")
+            return
+        hz = 1000.0 / ms
+        with self._lock:
+            rpm = self.live["rpm"]
+        if rpm < 100:
+            for key in ("hold_rpm", "start_rpm"):
+                try:
+                    rpm = float(self.param_vars[key].get())
+                    if rpm >= 100:
+                        break
+                except (KeyError, ValueError):
+                    rpm = 0.0
+        txt = f"= {hz:.1f} Hz update"
+        colour = "gray"
+        if rpm >= 100:
+            pulses = rpm * ppr / 60.0 * (ms / 1000.0)
+            txt += f", about {pulses:.1f} pulses per window at {rpm:.0f} RPM"
+            # Under a couple of teeth per window there is very little to average
+            # and the reading gets jumpy, whatever the timing method.
+            if pulses < 2.0:
+                txt += " - too few to steady the reading"
+                colour = "#B03A2E"
+        self.count_window_label.config(text=txt, foreground=colour)
+
     def _rpm_avg_lag_s(self):
         """Seconds of averaging lag at the RPM we are actually running at.
 
@@ -2173,6 +2424,8 @@ class DynoApp:
         self._send(f"RPM_RATIO,{self.cfg_vars['rpm_ratio'].get()}")
         self._send(f"RPM_SLEW,{self.cfg_vars['rpm_slew'].get()}")
         self._send(f"RPM_AVG,{self.cfg_vars['rpm_avg'].get()}")
+        self._send(f"RPM_COUNT_MS,{self.cfg_vars['rpm_count_ms'].get()}")
+        self._send(f"RPM_SOURCE,{self.cfg_vars['rpm_source'].get().split()[0]}")
 
     def _send_rampdown_cfg(self):
         # A cutoff below idle is the one setting here that can cause the problem
@@ -2577,6 +2830,16 @@ class DynoApp:
             if os.path.exists(target) and not os.access(target, os.W_OK):
                 bad.append(target)
         return bad
+
+    def _telemetry_age_s(self):
+        """Seconds since the last DATA frame, or None if none has arrived."""
+        if self._last_data_at is None:
+            return None
+        return time.monotonic() - self._last_data_at
+
+    def _telemetry_is_live(self, limit_s=2.0):
+        age = self._telemetry_age_s()
+        return age is not None and age <= limit_s
 
     def _update_blocked_reason(self):
         """Why an update must not run right now, or None if it may."""
@@ -3145,6 +3408,7 @@ class DynoApp:
     def _parse_line(self, line: str):
         # ---- DATA line (20 Hz) ----
         if line.startswith("DATA,"):
+            self._last_data_at = time.monotonic()
             parts = line.split(",")
             if len(parts) < 13:
                 return
@@ -3179,6 +3443,10 @@ class DynoApp:
             # so the frame shape will not change when it is fitted.
             enc_pos   = int(opt(19))
             enc_ok    = int(opt(20))
+            # The other two measurements of the same tach, always reported
+            # so a run can be judged on all three afterwards.
+            rpm_counted = opt(21)
+            rpm_rev     = opt(22)
 
             with self._lock:
                 self.live.update({
@@ -3193,6 +3461,7 @@ class DynoApp:
                     "press_mv": adc1, "spare_aux": spare_aux,
                     "glitches": glitches, "estimated": estimated,
                     "enc_pos": enc_pos, "enc_ok": enc_ok,
+                    "rpm_counted": rpm_counted, "rpm_rev": rpm_rev,
                 })
 
             # Feed the rolling monitor on every frame, recording or not.
@@ -3242,6 +3511,7 @@ class DynoApp:
                         f"{brake_pct:.1f}", f"{press_psi:.1f}", str(faults),
                         f"{spare_aux:.1f}",
                         str(glitches), str(estimated),
+                        f"{rpm_counted:.1f}", f"{rpm_rev:.1f}",
                     ])
                 self._plot_dirty = True
 
@@ -3584,11 +3854,18 @@ class DynoApp:
         # How much of the trace was filled in by the board rather than
         # measured. Amber, not red: it is working as asked, but the operator
         # should know a rising number means estimated data in the run.
+        # The other two methods, shown beside the one driving the loop so a
+        # disagreement between them is visible while the engine is running.
+        self.status_labels["rpm_counted"].config(
+            text=f"{d.get('rpm_counted', 0.0):.0f}")
+        self.status_labels["rpm_rev"].config(
+            text=f"{d.get('rpm_rev', 0.0):.0f}")
         es = int(d.get("estimated", 0))
         self.status_labels["estimated"].config(
             text=str(es), foreground=("#B9770E" if es else "black"))
         # Firmware too old to answer VERSION is flagged rather than left
         # blank: it also predates fields this GUI expects.
+        self._update_count_window()
         lag = self._rpm_avg_lag_s()
         if lag is None:
             self.rpm_lag_label.config(text="", foreground="gray")
@@ -4100,6 +4377,7 @@ class DynoApp:
                                            time.localtime(self._notes_edited))
                               if self._notes_edited else None),
             "_brake_char_stall": self._char_stall_at,
+            "_brake_effective_range": getattr(self, "_char_range", None),
             "_controller_cfg": [line for _tag, line in list(self.events)
                                 if "CFG," in line][-40:],
         }
@@ -4130,6 +4408,10 @@ class DynoApp:
             # exactly where the tach misbehaved and where a reading was
             # estimated rather than measured.
             "Tach_Glitches", "RPM_Estimated",
+            # The same tach measured three ways. RPM above is whichever one
+            # was driving the loop; these two are the other methods, so a
+            # run can be judged on all three after the fact.
+            "RPM_Counted", "RPM_Rev",
         ]
 
         filt = self._filtered_per_sample()      # None if no usable curve
@@ -4168,6 +4450,8 @@ class DynoApp:
                     r[9], r[10], r[11], r[12], r[15], r[16],
                     r[17] if len(r) > 17 else "",
                     r[18] if len(r) > 18 else "",
+                    r[19] if len(r) > 19 else "",
+                    r[20] if len(r) > 20 else "",
                 ])
         self.last_saved_run = path
         return len(rows)

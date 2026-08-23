@@ -28,13 +28,15 @@
 //             BRAKE_SWEEP,<target>,<ms>  one smooth timed traverse
 //             RPM_BAND,<min>,<max>  RPM_MEDIAN,<1|3|5|7>  RPM_RATIO,<x>
 //             RPM_EXTRAP,<0|1>,<points>,<maxrun>
+//             RPM_SOURCE,<0 gap|1 counted|2 revolution>
+//             RPM_COUNT_MS,<ms>  counting window length
 //             RPM_SLEW,<rpm/s>  RPM_AVG,<n>  TACH_RESET
 //             RAMPDOWN_MODE,<0-2>  RAMPDOWN_RATE,<rpm/s>  RAMPDOWN_BRAKE,<%/s>
 //             CUTOFF_RPM,<rpm>  THROTTLE_OFF,<pct>  RAMPDOWN  STOP_RATE,<%/s>
 //             CAM_MODEL,<0|1|2>  CAM_SPD,<steps/deg>  CAM_LIN,<0|1>
 //             CAM_NPTS,<n>  CAM_PT,<i>,<stepPct>,<brakePct>
 //   ESP → Pi  DATA,millis,rpm,torque,loadRaw,loadmV,pressmV,brakePos,targetRPM,
-//                  state,pidP,pidI,pidOut,brakePct,pressPSI,faultBits,spareAux,tachGlitches,rpmEstimated,encoderCount,encoderOK
+//                  state,pidP,pidI,pidOut,brakePct,pressPSI,faultBits,spareAux,tachGlitches,rpmEstimated,encoderCount,encoderOK,rpmCounted,rpmRev
 //             READY,ready,homed,tared,adc,sim,pressAdc
 //             CFG,<key>[,values]   ACK,<msg>   ERR,<msg>
 //   faultBits: bit0 = tach lost, bit1 = brake pressure over limit
@@ -69,7 +71,7 @@
 // Firmware version. Bump the minor when the serial protocol changes shape
 // (a new DATA field, a renamed command) so a mismatched GUI is diagnosable
 // from the log rather than from guesswork about which build is on the board.
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.6.1"
 
 // ─────────────────────────────────────────────────────────────────────
 // STEPPER ENCODER - TBD, HARDWARE NOT FITTED
@@ -258,6 +260,14 @@ volatile uint32_t pulseIntervalUs = 0;
 // accept, so it is electrical noise. Recomputed whenever TEETH or the maximum
 // valid RPM changes. The count is reported so the operator can see how much is
 // being thrown away rather than having to infer it from a ragged trace.
+// A revolution's worth of pulse timestamps. Timing one whole revolution
+// cancels tooth-to-tooth spacing error outright, which timing a single
+// gap cannot: an unevenly spaced tooth shows up as a fixed pattern that
+// no amount of averaging removes, it only smears.
+#define PULSE_TS_MAX 64
+volatile uint32_t pulseTs[PULSE_TS_MAX] = {0};
+volatile uint8_t  pulseTsIdx = 0;
+
 volatile uint32_t minPulseIntervalUs = 2500;
 volatile uint32_t tachGlitches       = 0;
 
@@ -266,7 +276,24 @@ float    rpmBuffer[RPM_AVG_MAX];
 // silently wraps a requested 500 to 244.
 uint16_t rpmBufIdx   = 0;
 uint16_t rpmBufCount = 0;
-float    currentRPM  = 0.0f;
+float    currentRPM  = 0.0f;      // whichever source drives the loop
+// The same tach measured three ways, all reported, so they can be compared
+// against each other on the same run rather than across two runs.
+//   0 gap      - time between consecutive pulses (fast, tooth-error prone)
+//   1 counted  - pulses per fixed window       (smooth, coarse, laggy)
+//   2 rev      - time for one whole revolution (tooth error cancels)
+float    rpmGap      = 0.0f;
+float    rpmCounted  = 0.0f;
+float    rpmRev      = 0.0f;
+uint8_t  rpmSource   = 1;         // RPM_SOURCE,<0|1|2>, counting by default
+// How long each counting window lasts. 100 ms is a 10 Hz update; longer
+// windows hold more pulses and read steadier, shorter ones answer sooner.
+uint32_t rpmCountWindowMs = 100;  // RPM_COUNT_MS,<ms>
+#define RPM_COUNT_MS_MIN 20
+#define RPM_COUNT_MS_MAX 5000
+uint32_t countWindowMs    = 0;
+uint32_t countWindowStart = 0;
+uint32_t countWindowTs    = 0;    // pulse timestamp at the window boundary
 uint16_t rpmAvgSize  = DEFAULT_RPM_AVG;   // RPM_AVG,<n>
 
 // Live RPM conditioning, ahead of the control loop.  Electrical noise on the
@@ -495,6 +522,8 @@ void IRAM_ATTR onProximityPulse() {
     pulseIntervalUs = dt;
     lastPulseUs = now;
     pulseCount++;
+    pulseTs[pulseTsIdx] = now;
+    pulseTsIdx = (uint8_t)((pulseTsIdx + 1) % PULSE_TS_MAX);
 }
 
 // Fastest credible tooth spacing, from the engine ceiling and the wheel.
@@ -597,17 +626,73 @@ static uint32_t intervalHist[RPM_MEDIAN_MAX] = {0};
 static uint8_t  intervalHistN   = 0;
 static uint32_t lastSeenPulse   = 0;
 
-static void updateRPM() {
-    uint32_t now = micros();
+// Pulses per window: how many teeth went by, over the time they took.
+//
+// The time is measured between the pulses themselves rather than between
+// the window edges, so the count is always a whole number of intervals and
+// the reading does not step. Dividing a whole pulse count by a fixed window
+// would quantise the answer to one pulse - about 200 RPM at 1500 on three
+// teeth in a 100 ms window, which a control loop would chase. The window
+// then only sets how often the reading updates and how many pulses it
+// averages over, which is what it is actually for.
+static void updateRPMCounted() {
+    uint32_t nowMs = millis();
+    if (countWindowMs == 0) {
+        countWindowMs = nowMs;
+        noInterrupts();
+        countWindowStart = pulseCount;
+        countWindowTs    = lastPulseUs;
+        interrupts();
+        return;
+    }
+    if ((nowMs - countWindowMs) < rpmCountWindowMs) return;
 
+    noInterrupts();
+    uint32_t c  = pulseCount;
+    uint32_t ts = lastPulseUs;
+    interrupts();
+
+    uint32_t n = c - countWindowStart;
+    uint8_t ppr = pulsesPerRev > 0 ? pulsesPerRev : 1;
+    if (n == 0) {
+        // No teeth at all this window. That is a stopped engine, which is a
+        // reading in its own right, not a bad sample to be filtered out.
+        rpmCounted = 0.0f;
+    } else {
+        uint32_t span = ts - countWindowTs;      // exactly n intervals
+        if (span > 0) {
+            float v = (float)n * 60000000.0f
+                      / ((float)span * (float)ppr) * driveRatio;
+            if (v >= rpmBandMin && v <= rpmBandMax) rpmCounted = v;
+        }
+    }
+    countWindowMs    = nowMs;
+    countWindowStart = c;
+    countWindowTs    = ts;
+    if (rpmSource == 1) currentRPM = rpmCounted;
+}
+
+static void updateRPM() {
     noInterrupts();
     uint32_t interval  = pulseIntervalUs;
     uint32_t lastPulse = lastPulseUs;
     uint32_t count     = pulseCount;
     interrupts();
 
-    if ((now - lastPulse) > RPM_TIMEOUT_US) {
+    // micros() AFTER the snapshot, and the age compared SIGNED. Read the
+    // other way round, a pulse landing between the two reads leaves
+    // lastPulse in the future, and the unsigned difference wraps to about
+    // 4.3e9 - comfortably past the timeout. That fired a spurious timeout
+    // several times a second at idle: the reading dropped to exactly zero
+    // for one frame and the averaging buffer was thrown away, while the
+    // pickup was working perfectly.
+    uint32_t now = micros();
+    int32_t age = (int32_t)(now - lastPulse);
+    if (age > (int32_t)RPM_TIMEOUT_US) {
         currentRPM    = 0.0f;
+        rpmGap        = 0.0f;
+        rpmRev        = 0.0f;
+        rpmCounted    = 0.0f;
         rpmBufCount   = 0;
         rpmBufIdx     = 0;
         intervalHistN = 0;
@@ -684,10 +769,30 @@ static void updateRPM() {
         pushRpmHistory(lastPulse, instantRPM);
     }
 
+    // Whole-revolution period: the gap between this pulse and the one a
+    // full revolution back. Every tooth contributes exactly once, so their
+    // spacing errors cancel instead of alternating.
+    if (ppr >= 1 && ppr < PULSE_TS_MAX) {
+        noInterrupts();
+        uint8_t i = pulseTsIdx;
+        uint32_t newest = pulseTs[(uint8_t)((i + PULSE_TS_MAX - 1) % PULSE_TS_MAX)];
+        uint32_t older  = pulseTs[(uint8_t)((i + PULSE_TS_MAX - 1 - ppr) % PULSE_TS_MAX)];
+        interrupts();
+        uint32_t revUs = newest - older;
+        if (older != 0 && revUs > 1000 && revUs < 60000000UL) {
+            float v = 60000000.0f / (float)revUs * driveRatio;
+            if (v >= rpmBandMin && v <= rpmBandMax) {
+                rpmRev = v;
+                if (rpmSource == 2) currentRPM = rpmRev;
+            }
+        }
+    }
+
     uint16_t avg = rpmAvgSize;
     if (avg < 1) avg = 1;
     if (avg > RPM_AVG_MAX) avg = RPM_AVG_MAX;
-    currentRPM = addToAvg(rpmBuffer, rpmBufIdx, rpmBufCount, avg, instantRPM);
+    rpmGap = addToAvg(rpmBuffer, rpmBufIdx, rpmBufCount, avg, instantRPM);
+    if (rpmSource == 0) currentRPM = rpmGap;
 }
 
 // =============================================
@@ -1369,6 +1474,25 @@ static void processCommand(const char* cmd) {
         extrapRun = 0;
         return;
     }
+    // RPM_COUNT_MS,<ms> - how long each counting window lasts
+    if (s.startsWith("RPM_COUNT_MS,")) {
+        long v = s.substring(13).toInt();
+        if (v >= RPM_COUNT_MS_MIN && v <= RPM_COUNT_MS_MAX) {
+            rpmCountWindowMs = (uint32_t)v;
+            countWindowMs = 0;          // restart the window on the new length
+        } else {
+            Serial.printf("ERR,RPM_COUNT_MS must be %d-%d\n",
+                          RPM_COUNT_MS_MIN, RPM_COUNT_MS_MAX);
+        }
+        return;
+    }
+    // RPM_SOURCE,<0 gap|1 counted|2 revolution> - which one drives the loop
+    if (s.startsWith("RPM_SOURCE,")) {
+        int n = s.substring(11).toInt();
+        if (n >= 0 && n <= 2) rpmSource = (uint8_t)n;
+        else Serial.println("ERR,RPM_SOURCE must be 0, 1 or 2");
+        return;
+    }
     if (s.startsWith("RPM_MEDIAN,")) {
         int n = s.substring(11).toInt();
         if (n == 1 || n == 3 || n == 5 || n == 7) {
@@ -1615,6 +1739,9 @@ static void processCommand(const char* cmd) {
         Serial.printf("CFG,ENCODER,%d,%lu,%d,%d\n", encoderEnabled ? 1 : 0,
                        (unsigned long)encoderCPR, encoderInvert ? 1 : 0,
                        encoderOK ? 1 : 0);
+        Serial.printf("CFG,RPM_SOURCE,%u\n", (unsigned)rpmSource);
+        Serial.printf("CFG,RPM_COUNT_MS,%lu\n",
+                       (unsigned long)rpmCountWindowMs);
         Serial.printf("CFG,RPM_MEDIAN,%u\n", (unsigned)rpmMedianN);
         Serial.printf("CFG,RPM_EXTRAP,%d,%u,%u\n", rpmExtrapOn ? 1 : 0,
                        (unsigned)rpmExtrapN, (unsigned)rpmExtrapMax);
@@ -1695,7 +1822,7 @@ static void sendDataReport() {
     // Field 5 is the load-cell ADC reading. Field 6 now carries the pressure
     // sensor's own millivolts from the dedicated ADS1115, because that is the
     // value the calibration workflow captures; the DFRobot spare moved to 16.
-    Serial.printf("DATA,%lu,%.1f,%.2f,%.1f,%.1f,%.1f,%ld,%.1f,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%.1f,%lu,%lu,%ld,%d\n",
+    Serial.printf("DATA,%lu,%.1f,%.2f,%.1f,%.1f,%.1f,%ld,%.1f,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%.1f,%lu,%lu,%ld,%d,%.1f,%.1f\n",
         millis(),
         currentRPM,
         currentTorque,
@@ -1715,7 +1842,9 @@ static void sendDataReport() {
         (unsigned long)tachGlitches,
         (unsigned long)rpmExtrapolated,
         (long)encoderCount,          // TBD: 0 until an encoder is fitted
-        encoderOK ? 1 : 0);
+        encoderOK ? 1 : 0,
+        rpmCounted,
+        rpmRev);
 }
 
 // =============================================
@@ -2116,6 +2245,7 @@ void loop() {
         updateSimEngine(dt);
     } else {
         updateRPM();
+    updateRPMCounted();
     updateEncoder();
         lastSimUs = 0;                           // reset dt baseline for next SIM entry
     }
