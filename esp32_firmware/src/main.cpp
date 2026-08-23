@@ -24,6 +24,7 @@
 //             TEETH,<n>  RATIO,<r>  BRAKE_RANGE,<min>,<max>  PRELOAD,<pct>
 //             INVERT,<0|1>  STEPPER_SPEED,<v>  STEPPER_ACCEL,<v>
 //             VERSION (firmware version and build stamp)
+//             ENCODER,<0|1>,<cpr>,<invert>   TBD - stored, not yet active
 //             RPM_BAND,<min>,<max>  RPM_MEDIAN,<1|3|5|7>  RPM_RATIO,<x>
 //             RPM_EXTRAP,<0|1>,<points>,<maxrun>
 //             RPM_SLEW,<rpm/s>  RPM_AVG,<n>  TACH_RESET
@@ -32,7 +33,7 @@
 //             CAM_MODEL,<0|1|2>  CAM_SPD,<steps/deg>  CAM_LIN,<0|1>
 //             CAM_NPTS,<n>  CAM_PT,<i>,<stepPct>,<brakePct>
 //   ESP → Pi  DATA,millis,rpm,torque,loadRaw,loadmV,pressmV,brakePos,targetRPM,
-//                  state,pidP,pidI,pidOut,brakePct,pressPSI,faultBits,spareAux,tachGlitches,rpmEstimated
+//                  state,pidP,pidI,pidOut,brakePct,pressPSI,faultBits,spareAux,tachGlitches,rpmEstimated,encoderCount,encoderOK
 //             READY,ready,homed,tared,adc,sim,pressAdc
 //             CFG,<key>[,values]   ACK,<msg>   ERR,<msg>
 //   faultBits: bit0 = tach lost, bit1 = brake pressure over limit
@@ -67,7 +68,41 @@
 // Firmware version. Bump the minor when the serial protocol changes shape
 // (a new DATA field, a renamed command) so a mismatched GUI is diagnosable
 // from the log rather than from guesswork about which build is on the board.
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
+
+// ─────────────────────────────────────────────────────────────────────
+// STEPPER ENCODER - TBD, HARDWARE NOT FITTED
+//
+// Nothing here reads a real encoder yet. Position is open loop: the
+// controller commands microsteps and assumes they arrive, which is exactly
+// the assumption a stall breaks. The settings and the reporting path exist
+// now so that fitting the hardware is a matter of filling in updateEncoder()
+// and attaching the interrupts, without changing the serial protocol or
+// the GUI - DATA already carries the two fields, reporting 0 and not-ok.
+//
+// When it is fitted:
+//   * pick two free GPIO for A/B (GPIO26-37 are consumed by opi_opi
+//     memory on this board, and 8/9 and 10/11 are the two I2C buses)
+//   * attach both edges of both channels to a quadrature ISR
+//   * compare encoderSteps() against stepper.currentPosition() to detect a
+//     stall directly, which replaces the GUI's pressure-based inference
+//   * decide whether a confirmed stall should fault the run outright
+// ─────────────────────────────────────────────────────────────────────
+#define ENCODER_PIN_A -1              // TBD: not assigned
+#define ENCODER_PIN_B -1              // TBD: not assigned
+bool     encoderEnabled = false;      // ENCODER,<0|1>,<cpr>,<invert>
+uint32_t encoderCPR     = 4000;       // counts per motor revolution
+bool     encoderInvert  = false;
+volatile int32_t encoderCount = 0;    // stays 0 until the hardware exists
+bool     encoderOK      = false;      // never true without a real encoder
+
+// TBD: no hardware, so there is nothing to read. Deliberately does not fake
+// a value from the commanded position - that would report agreement it
+// cannot possibly have measured, which is worse than reporting nothing.
+static void updateEncoder() {
+    encoderOK = false;
+}
+
 
 #define DEFAULT_PULSES_PER_REV 3     // Proximity triggers/rev (runtime: TEETH,<n>)
 // Averaging is capped only by RAM (200 floats is 800 bytes). Long windows are
@@ -1481,6 +1516,26 @@ static void processCommand(const char* cmd) {
     }
 
     // ---- Query configuration ----
+    // ENCODER,<0|1>,<counts per rev>,<invert>  - TBD, stored but inert
+    if (s.startsWith("ENCODER,")) {
+        int i1 = s.indexOf(',', 8);
+        int i2 = (i1 > 0) ? s.indexOf(',', i1 + 1) : -1;
+        bool want = ((i1 > 0 ? s.substring(8, i1) : s.substring(8)).toInt() != 0);
+        if (i1 > 0) {
+            long c = (i2 > 0 ? s.substring(i1 + 1, i2)
+                             : s.substring(i1 + 1)).toInt();
+            if (c >= 1 && c <= 1000000) encoderCPR = (uint32_t)c;
+            else Serial.println("ERR,ENCODER counts per rev must be 1-1000000");
+        }
+        if (i2 > 0) encoderInvert = (s.substring(i2 + 1).toInt() != 0);
+        encoderEnabled = want;
+        // Say so plainly rather than silently accepting: asking for an
+        // encoder that is not wired should not look like it worked.
+        if (encoderEnabled && ENCODER_PIN_A < 0) {
+            Serial.println("ERR,ENCODER not fitted - setting stored, no pins assigned (TBD)");
+        }
+        return;
+    }
     if (s == "VERSION") {
         Serial.printf("CFG,FW_VERSION,%s,%s %s\n", FW_VERSION, __DATE__, __TIME__);
         return;
@@ -1498,6 +1553,9 @@ static void processCommand(const char* cmd) {
         Serial.printf("CFG,TEETH,%u\n", (unsigned)pulsesPerRev);
         Serial.printf("CFG,RATIO,%.4f\n", driveRatio);
         Serial.printf("CFG,RPM_BAND,%.1f,%.1f\n", rpmBandMin, rpmBandMax);
+        Serial.printf("CFG,ENCODER,%d,%lu,%d,%d\n", encoderEnabled ? 1 : 0,
+                       (unsigned long)encoderCPR, encoderInvert ? 1 : 0,
+                       encoderOK ? 1 : 0);
         Serial.printf("CFG,RPM_MEDIAN,%u\n", (unsigned)rpmMedianN);
         Serial.printf("CFG,RPM_EXTRAP,%d,%u,%u\n", rpmExtrapOn ? 1 : 0,
                        (unsigned)rpmExtrapN, (unsigned)rpmExtrapMax);
@@ -1578,7 +1636,7 @@ static void sendDataReport() {
     // Field 5 is the load-cell ADC reading. Field 6 now carries the pressure
     // sensor's own millivolts from the dedicated ADS1115, because that is the
     // value the calibration workflow captures; the DFRobot spare moved to 16.
-    Serial.printf("DATA,%lu,%.1f,%.2f,%.1f,%.1f,%.1f,%ld,%.1f,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%.1f,%lu,%lu\n",
+    Serial.printf("DATA,%lu,%.1f,%.2f,%.1f,%.1f,%.1f,%ld,%.1f,%s,%.2f,%.2f,%.2f,%.1f,%.1f,%u,%.1f,%lu,%lu,%ld,%d\n",
         millis(),
         currentRPM,
         currentTorque,
@@ -1596,7 +1654,9 @@ static void sendDataReport() {
         (unsigned)faults,
         spareAux_mV,
         (unsigned long)tachGlitches,
-        (unsigned long)rpmExtrapolated);
+        (unsigned long)rpmExtrapolated,
+        (long)encoderCount,          // TBD: 0 until an encoder is fitted
+        encoderOK ? 1 : 0);
 }
 
 // =============================================
@@ -1995,6 +2055,7 @@ void loop() {
         updateSimEngine(dt);
     } else {
         updateRPM();
+    updateEncoder();
         lastSimUs = 0;                           // reset dt baseline for next SIM entry
     }
 

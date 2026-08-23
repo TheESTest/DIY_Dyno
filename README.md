@@ -6,8 +6,8 @@ a stepper-actuated hydraulic brake.
 
 | Component | Version | Location |
 |---|---|---|
-| Raspberry Pi UI | 1.1.0 | [`pi_gui/`](pi_gui/) |
-| ESP32-S3 firmware | 1.1.0 | [`esp32_firmware/`](esp32_firmware/) |
+| Raspberry Pi UI | 1.2.0 | [`pi_gui/`](pi_gui/) |
+| ESP32-S3 firmware | 1.2.0 | [`esp32_firmware/`](esp32_firmware/) |
 
 Both versions are recorded in the `_conditions.json` file saved beside every
 run, so a result can be traced back to the code that produced it. The UI shows
@@ -58,6 +58,28 @@ invent a runaway, and the brake acts on whatever it is told. Every substitution
 is counted and reported, and both `Tach_Glitches` and `RPM_Estimated` are
 written to the run CSV as running totals, so where they step up is exactly where
 the tach misbehaved and where a value was estimated rather than measured.
+
+## Stepper position: open loop, for now
+
+There is **no encoder on the stepper**. The controller commands microsteps and
+assumes they arrive, which is exactly the assumption a stall breaks. The
+firmware carries a marked TBD block for one — settings (`ENCODER,<0|1>,<cpr>,
+<invert>`), a `CFG,ENCODER` readback, two reserved `DATA` fields and a stub
+`updateEncoder()` — so fitting the hardware will not change the protocol or the
+UI. Nothing fakes a value in the meantime: enabling an encoder with no pins
+assigned answers with an error rather than quietly accepting, and the position
+field reports `not installed` rather than echoing the commanded position, which
+would report an agreement it has not measured.
+
+Until then, **line pressure is the witness** that the motor went where it was
+told. During the brake characterisation sweep, once the brake is engaged,
+commanded position climbing while pressure stays flat is flagged as a possible
+stall. The takeup travel before the pads bite is deliberately ignored — position
+rising with no pressure is normal there, and judging it would flag every healthy
+sweep. A brake that is already fully applied looks identical to a stalled motor
+from here, so this reports a suspicion, not a verdict: the point at which the
+sweep stopped being trustworthy is marked on the plot, written to the CSV as
+`Stall_Suspected`, and recorded in the run's conditions file.
 
 ## Running it
 

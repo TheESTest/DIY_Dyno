@@ -110,7 +110,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.1.0"
+UI_VERSION = "1.2.0"
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dyno_runs")
 
@@ -127,6 +127,18 @@ CHAR_UP_S = 10.0
 CHAR_HOLD_S = 1.0
 CHAR_DOWN_S = 10.0
 CHAR_TICK_MS = 50            # command and sample at 20 Hz, matching DATA
+
+# Stall watch for the sweep. Without an encoder there is no way to know the
+# motor actually went where it was told, so pressure is used as the witness:
+# once the brake is engaged, commanded position and pressure should climb
+# together, and position climbing alone means the steps are not arriving.
+# Nothing is judged until pressure has risen past CHAR_ENGAGE_PSI, because
+# the takeup travel before the pads bite legitimately produces no pressure.
+CHAR_ENGAGE_PSI = 20.0       # rise above baseline that counts as engaged
+CHAR_STALL_STEPS = 100.0     # commanded increase over the window to judge on
+CHAR_STALL_PSI = 2.0         # pressure rise expected across that increase
+CHAR_STALL_WIN_S = 1.0       # sliding window the comparison is made over
+CHAR_STALL_HOLD_S = 1.0      # how long it must persist before flagging
 
 # Motor "reaction" during CSV replay — nudge the real brake stepper so it
 # visibly responds to the replayed data, geared WAY down so it moves gently.
@@ -192,7 +204,7 @@ class DynoApp:
             "pid_p": 0.0, "pid_i": 0.0, "pid_out": 0.0,
             "brake_pct": 0.0, "press_psi": 0.0, "faults": 0,
             "press_mv": 0.0, "spare_aux": 0.0, "glitches": 0,
-            "estimated": 0,
+            "estimated": 0, "enc_pos": 0, "enc_ok": 0,
         }
         # What the board says it is running. Unknown until it answers, and
         # firmware old enough not to report one leaves it that way.
@@ -284,6 +296,12 @@ class DynoApp:
             "rpm_extrap":     tk.BooleanVar(value=False),
             "rpm_extrap_n":   tk.StringVar(value="4"),
             "rpm_extrap_max": tk.StringVar(value="5"),
+            # Brake sweep stall watch
+            "char_stop_on_stall": tk.BooleanVar(value=False),
+            # Stepper encoder - hardware not fitted yet, see the TBD panel
+            "enc_enabled":   tk.BooleanVar(value=False),
+            "enc_cpr":       tk.StringVar(value="4000"),
+            "enc_invert":    tk.BooleanVar(value=False),
             "rpm_median":    tk.StringVar(value="3"),
             "rpm_ratio":     tk.StringVar(value="3.0"),
             "rpm_slew":      tk.StringVar(value="0"),
@@ -350,6 +368,10 @@ class DynoApp:
         self._char_active = False
         self._char_rows = []
         self._char_home = 0
+        self._char_engaged = False
+        self._char_base_psi = None
+        self._char_susp_since = None
+        self._char_stall_at = None
         self._load_session()
         self._schedule_gui_update()
         self._schedule_status_poll()
@@ -1167,6 +1189,42 @@ class DynoApp:
         ttk.Button(bk, text="Send", command=self._send_brake_cfg).pack(
             padx=4, pady=4, anchor=tk.W)
 
+        enc = ttk.LabelFrame(bk, text="Stepper encoder  -  TBD, not yet fitted")
+        enc.pack(fill=tk.X, padx=4, pady=(6, 2))
+        ttk.Label(enc, wraplength=370, justify=tk.LEFT, foreground="#B9770E",
+                  text=("PLACEHOLDER. No encoder is installed and nothing here "
+                        "does anything yet. The firmware accepts and reports "
+                        "these settings so the plumbing is already in place, "
+                        "but position remains open-loop: the controller "
+                        "commands steps and assumes they arrive. When the "
+                        "encoder is fitted this is where it gets configured, "
+                        "and the stall watch below can be replaced by a direct "
+                        "measurement of where the shaft actually is.")
+                  ).pack(anchor=tk.W, padx=4, pady=2)
+        self.enc_chk = ttk.Checkbutton(
+            enc, text="Encoder fitted", variable=self.cfg_vars["enc_enabled"],
+            command=self._send_encoder_cfg)
+        self.enc_chk.pack(anchor=tk.W, padx=4)
+        enrow = ttk.Frame(enc)
+        enrow.pack(fill=tk.X, padx=4, pady=1)
+        ttk.Label(enrow, text="Counts per rev:", width=18,
+                  anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Entry(enrow, textvariable=self.cfg_vars["enc_cpr"],
+                  width=8).pack(side=tk.LEFT)
+        ttk.Checkbutton(enrow, text="reverse",
+                        variable=self.cfg_vars["enc_invert"]).pack(
+                            side=tk.LEFT, padx=6)
+        esrow = ttk.Frame(enc)
+        esrow.pack(fill=tk.X, padx=4, pady=(1, 4))
+        ttk.Label(esrow, text="Encoder position:", width=18,
+                  anchor=tk.W).pack(side=tk.LEFT)
+        self.enc_pos_label = ttk.Label(esrow, text="not installed",
+                                       foreground="gray")
+        self.enc_pos_label.pack(side=tk.LEFT)
+        ttk.Button(enc, text="Send encoder settings", width=22,
+                   command=self._send_encoder_cfg).pack(anchor=tk.W,
+                                                        padx=4, pady=(0, 4))
+
         ttk.Separator(bk, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=4, pady=4)
         crow = ttk.Frame(bk)
         crow.pack(fill=tk.X, padx=4, pady=(0, 2))
@@ -1175,6 +1233,21 @@ class DynoApp:
         self.char_btn.pack(side=tk.LEFT)
         self.char_progress = ttk.Label(crow, text="", foreground="gray")
         self.char_progress.pack(side=tk.LEFT, padx=8)
+        self.char_stall_label = ttk.Label(bk, text="", foreground="#B03A2E")
+        self.char_stall_label.pack(anchor=tk.W, padx=4)
+        ttk.Checkbutton(bk, text="Stop the sweep if a stall is suspected",
+                        variable=self.cfg_vars["char_stop_on_stall"]).pack(
+                            anchor=tk.W, padx=4)
+        ttk.Label(bk, wraplength=380, justify=tk.LEFT, foreground="gray",
+                  text=("With no encoder fitted, pressure is the only witness "
+                        "that the motor went where it was told. Once the brake "
+                        "is engaged, commanded position rising while pressure "
+                        "stays flat is flagged as a possible stall - the takeup "
+                        "travel before the pads bite is ignored, since no "
+                        "pressure is expected there. A brake already fully "
+                        "applied looks the same, so this is a suspicion to "
+                        "check, not a verdict.")
+                  ).pack(anchor=tk.W, padx=4, pady=(0, 4))
         ttk.Label(bk, wraplength=380, justify=tk.LEFT, foreground="gray",
                   text=("Homes first, then walks the brake from home to full travel "
                         "over 10 s, holds, and returns - recording position against "
@@ -1354,6 +1427,13 @@ class DynoApp:
             return hi + (lo - hi) * f, "down"
         return lo, "done"
 
+    def _send_encoder_cfg(self):
+        """Push the encoder settings. Accepted and stored by the firmware,
+        but inert until the hardware exists - see the TBD panel."""
+        self._send(f"ENCODER,{1 if self.cfg_vars['enc_enabled'].get() else 0},"
+                   f"{self.cfg_vars['enc_cpr'].get()},"
+                   f"{1 if self.cfg_vars['enc_invert'].get() else 0}")
+
     def _start_brake_char(self):
         """Sweep the brake across its travel and back, logging position vs PSI."""
         if self._char_active:                 # button doubles as the abort
@@ -1391,6 +1471,11 @@ class DynoApp:
         with self._lock:
             self._char_home = int(self.live["brake_pos"])
         self._char_rows = []
+        self._char_engaged = False
+        self._char_base_psi = None
+        self._char_susp_since = None
+        self._char_stall_at = None
+        self.char_stall_label.config(text="")
         self._char_active = True
         self._char_t0 = time.monotonic()
         self.char_btn.config(text="Abort sweep")
@@ -1409,16 +1494,89 @@ class DynoApp:
         self._send(f"BRAKE,{int(round(target))}")
         with self._lock:
             d = dict(self.live)
+        # Only the outward leg: on the way back position falls by design, so
+        # the comparison means nothing there.
+        stalled = False
+        if phase == "up":
+            stalled = self._char_check_stall(elapsed, target, d["press_psi"])
+
         self._char_rows.append([
             f"{elapsed:.3f}", phase, f"{target:.1f}",
             f"{d['brake_pos']}", f"{d['brake_pct']:.2f}",
             f"{d['press_psi']:.2f}", f"{d['press_mv']:.1f}",
             f"{d['load_raw']:.2f}", f"{d['rpm']:.1f}",
+            "1" if self._char_stall_at else "0",
         ])
-        self.char_progress.config(
-            text=f"{phase}  {elapsed:4.1f}s   cmd {int(target)}   "
-                 f"{d['press_psi']:.0f} PSI")
+
+        if stalled:
+            s = self._char_stall_at
+            msg = (f"Possible stall at {s['time_s']:.1f}s: commanded "
+                   f"+{s['steps_gained']:.0f} steps for only "
+                   f"+{s['psi_gained']:.1f} PSI")
+            self._log_event(msg, "err")
+            self.char_stall_label.config(
+                text=f"STALL? {s['commanded']:.0f} steps / {s['psi']:.0f} PSI")
+            if self.cfg_vars["char_stop_on_stall"].get():
+                self._abort_brake_char(msg)
+                return
+
+        if self._char_stall_at:
+            self.char_progress.config(
+                text=f"{phase}  {elapsed:4.1f}s   cmd {int(target)}   "
+                     f"{d['press_psi']:.0f} PSI   (stall suspected)")
+        else:
+            self.char_progress.config(
+                text=f"{phase}  {elapsed:4.1f}s   cmd {int(target)}   "
+                     f"{d['press_psi']:.0f} PSI")
         self.root.after(CHAR_TICK_MS, self._char_tick)
+
+    def _char_check_stall(self, elapsed, target, psi):
+        """Watch for commanded position climbing while pressure does not.
+
+        Returns True the moment a stall is first suspected. A fully applied
+        brake looks the same as a stalled motor from here - both are position
+        going up with pressure flat - so this reports a suspicion, not a
+        verdict, and the sweep records where it happened rather than deciding
+        what it means.
+        """
+        if self._char_stall_at is not None:
+            return False                       # already flagged, once is enough
+        if self._char_base_psi is None:
+            self._char_base_psi = psi
+            return False
+        # Below the takeup point there is nothing to compare against: the
+        # actuator is moving and no pressure is expected yet.
+        if not self._char_engaged:
+            if psi > self._char_base_psi + CHAR_ENGAGE_PSI:
+                self._char_engaged = True
+            return False
+
+        cutoff = elapsed - CHAR_STALL_WIN_S
+        past = None
+        for r in self._char_rows:              # oldest sample still in the window
+            if float(r[0]) >= cutoff:
+                past = r
+                break
+        if past is None:
+            return False
+
+        dpos = target - float(past[2])
+        dpsi = psi - float(past[5])
+        if dpos >= CHAR_STALL_STEPS and dpsi < CHAR_STALL_PSI:
+            if self._char_susp_since is None:
+                self._char_susp_since = elapsed
+            elif elapsed - self._char_susp_since >= CHAR_STALL_HOLD_S:
+                self._char_stall_at = {
+                    "time_s": round(elapsed, 2),
+                    "commanded": round(target, 1),
+                    "psi": round(psi, 2),
+                    "steps_gained": round(dpos, 1),
+                    "psi_gained": round(dpsi, 2),
+                }
+                return True
+        else:
+            self._char_susp_since = None       # pressure moved, not a stall
+        return False
 
     def _abort_brake_char(self, why):
         self._char_active = False
@@ -1444,7 +1602,7 @@ class DynoApp:
                 w = csv.writer(f)
                 w.writerow(["Time_s", "Phase", "Commanded_Steps", "Brake_Pos",
                             "Brake_Pct", "Brake_PSI", "Pressure_mV",
-                            "LoadCell_mV", "RPM"])
+                            "LoadCell_mV", "RPM", "Stall_Suspected"])
                 w.writerows(rows)
             self._write_conditions(base + "_conditions.json", base + ".csv")
             self._plot_brake_char(rows, base + ".png", stamp)
@@ -1456,9 +1614,23 @@ class DynoApp:
         self.char_progress.config(text=f"Saved brake_char_{stamp}")
         self._log_event(f"Brake characterisation saved: brake_char_{stamp}"
                         f" ({len(rows)} samples)", "ack")
-        messagebox.showinfo(
-            "Characterisation complete",
-            f"{len(rows)} samples saved to:\n{base}.csv\n\nPlot: {base}.png")
+        if self._char_stall_at:
+            st = self._char_stall_at
+            messagebox.showwarning(
+                "Possible stall during the sweep",
+                f"At {st['time_s']:.1f}s the commanded position rose "
+                f"{st['steps_gained']:.0f} microsteps for only "
+                f"{st['psi_gained']:.1f} PSI, at {st['commanded']:.0f} steps "
+                f"and {st['psi']:.0f} PSI.\n\n"
+                "Either the motor stopped keeping up with the commanded "
+                "position, or the brake was already fully applied - without "
+                "an encoder those look identical from here. Treat travel "
+                "beyond that point as unverified.\n\n"
+                f"{len(rows)} samples saved to:\n{base}.csv")
+        else:
+            messagebox.showinfo(
+                "Characterisation complete",
+                f"{len(rows)} samples saved to:\n{base}.csv\n\nPlot: {base}.png")
 
     def _plot_brake_char(self, rows, path, stamp):
         """Two views: pressure against position, and both against time."""
@@ -1498,6 +1670,15 @@ class DynoApp:
                             xy=(x, ax.get_ylim()[1] * 0.85),
                             xytext=(6, 0), textcoords="offset points",
                             color="tab:green", fontsize=9)
+
+        # Where the sweep stopped being trustworthy, marked on the curve it
+        # affects rather than only in the log.
+        if self._char_stall_at:
+            sx = self._char_stall_at['commanded']
+            ax.axvline(sx, color="tab:red", linestyle=":", linewidth=1.6)
+            ax.annotate("possible stall", xy=(sx, ax.get_ylim()[1] * 0.55),
+                        xytext=(6, 0), textcoords="offset points",
+                        color="tab:red", fontsize=9)
 
         ax2 = fig.add_subplot(212)
         ax2.plot(t, pos, "-", color="tab:orange", linewidth=1.3, label="position")
@@ -2268,6 +2449,10 @@ class DynoApp:
             spare_aux = opt(16)
             glitches  = int(opt(17))
             estimated = int(opt(18))    # samples the board filled in itself
+            # Reserved for the encoder. Always 0 until the hardware exists,
+            # so the frame shape will not change when it is fitted.
+            enc_pos   = int(opt(19))
+            enc_ok    = int(opt(20))
 
             with self._lock:
                 self.live.update({
@@ -2281,6 +2466,7 @@ class DynoApp:
                     # has a dedicated ADS1115; field 16 is the old DFRobot spare.
                     "press_mv": adc1, "spare_aux": spare_aux,
                     "glitches": glitches, "estimated": estimated,
+                    "enc_pos": enc_pos, "enc_ok": enc_ok,
                 })
 
             # Feed the rolling monitor on every frame, recording or not.
@@ -2678,6 +2864,13 @@ class DynoApp:
         self.status_labels["fw_version"].config(
             text=self.fw_version,
             foreground=("#B9770E" if self.fw_version == "unknown" else "black"))
+        # Reads 'not installed' until a board reports a live encoder, so the
+        # panel never implies a measurement that is not being taken.
+        if d.get("enc_ok"):
+            self.enc_pos_label.config(text=str(d.get("enc_pos", 0)),
+                                      foreground="black")
+        else:
+            self.enc_pos_label.config(text="not installed", foreground="gray")
         self.status_labels["load_raw"].config(text=f"{d['load_raw']:.1f}")
         # "At rail" rather than a number: the 0-10 V module clamps at zero, so a
         # reading of 0 is the bottom of the range, not a measurement.
@@ -3156,6 +3349,7 @@ class DynoApp:
             "_torque_units": self.units_var.get(),
             "_torque_calibrated": bool(self.recorded_torque_is_nm),
             "_samples": len(self.log_rows),
+            "_brake_char_stall": self._char_stall_at,
             "_controller_cfg": [line for _tag, line in list(self.events)
                                 if "CFG," in line][-40:],
         }
