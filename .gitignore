@@ -1,0 +1,16 @@
+# Build output
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+
+# Recorded runs and operator state - data, not source
+dyno_runs/
+dyno_last_session.json
+*.bak_*
+
+# Local documents kept alongside the code
+*.pdf
+*.xlsx
+*.docx
+*.zip

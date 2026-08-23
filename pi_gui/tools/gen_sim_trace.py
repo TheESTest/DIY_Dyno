@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+gen_sim_trace.py — build the ESP32-S3 firmware's SIM (bench-demo) trace header
+from a recorded dyno run.
+
+The DIY dyno bench has the real electronics (ESP32-S3 + brake stepper + load
+cell) but no engine.  The firmware's SIM mode plays a "virtual engine" so the
+whole chain reacts in real time.  That virtual engine needs one thing baked in:
+a torque-vs-RPM curve taken from a real recorded pull, so the injected torque
+looks like the real data (the user chose "inject recorded torque").
+
+This tool reads a recorded run (the team's "Dyno run 28 May 2025 smooth.xlsx",
+or any CSV/TXT the Pi loader understands), bins torque against RPM, lightly
+smooths it, and emits `sim_trace.h` — a compact PROGMEM lookup the firmware
+interpolates at runtime.
+
+Usage (run from this Pi-code folder, where the .xlsx lives):
+    python tools/gen_sim_trace.py \
+        --input "Dyno run 28 May 2025 smooth.xlsx" \
+        --output "<path-to>/DIY_Dyno_ESP32S3_Firmware/include/sim_trace.h" \
+        --points 64
+
+The ESP32-S3 firmware (separate PlatformIO project) #includes the generated
+sim_trace.h from its include/ folder; point --output there.
+
+Requires openpyxl only when --input is an .xlsx.  Reuses dyno_dsp for loading
+CSV/TXT logs so the format auto-detection stays in one place.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+import numpy as np
+
+# Make dyno_dsp importable whether run from repo root or tools/.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))
+import dyno_dsp as dsp  # noqa: E402
+
+
+def _load_rpm_torque(path: str):
+    """Return (rpm, torque) float arrays from a recorded run (xlsx or CSV/TXT)."""
+    if path.lower().endswith((".xlsx", ".xlsm")):
+        rpm, tq = _load_xlsx(path)
+    else:
+        rec = dsp.load_recording(path)
+        if rec.rpm is None or rec.torque is None:
+            raise SystemExit(f"{path}: no RPM/torque channel found")
+        rpm, tq = np.asarray(rec.rpm, float), np.asarray(rec.torque, float)
+    m = np.isfinite(rpm) & np.isfinite(tq) & (rpm > 0)
+    return rpm[m], tq[m]
+
+
+def _load_xlsx(path: str):
+    """Read the first two numeric-looking RPM/Torque columns from an .xlsx."""
+    try:
+        import openpyxl
+    except ImportError:
+        raise SystemExit("openpyxl is required to read .xlsx inputs "
+                         "(pip install openpyxl), or pass a CSV/TXT export instead.")
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+    if not rows:
+        raise SystemExit(f"{path}: empty sheet")
+    header = [str(c).strip().lower() if c is not None else "" for c in rows[0]]
+
+    def find(*keys):
+        for i, h in enumerate(header):
+            if any(k in h for k in keys):
+                return i
+        return None
+    rpm_i = find("rpm")
+    tq_i = find("torque")
+    if rpm_i is None or tq_i is None:      # fall back to fixed layout (col B, C)
+        rpm_i, tq_i = 1, 2
+    rpm, tq = [], []
+    for r in rows[1:]:
+        try:
+            rv = r[rpm_i]
+            tv = r[tq_i]
+        except IndexError:
+            continue
+        rpm.append(float(rv) if isinstance(rv, (int, float)) else np.nan)
+        tq.append(float(tv) if isinstance(tv, (int, float)) else np.nan)
+    return np.asarray(rpm, float), np.asarray(tq, float)
+
+
+def build_curve(rpm, tq, *, bin_step=100.0, smooth_win=5, npoints=64):
+    """Bin torque vs RPM, smooth, and resample to a monotone lookup of `npoints`."""
+    # Reuse the same RPM-domain binning the analysis tab uses, so the SIM curve
+    # is consistent with how the GUI would present this run.
+    grid_rpm, grid_tq = dsp.resample_by_rpm(rpm, tq, rpm_step=bin_step)
+    if grid_rpm.size < 2:
+        raise SystemExit("not enough populated RPM bins to build a curve")
+    # Light centered moving-average smoothing (raw load-cell torque is noisy).
+    grid_tq = dsp.centered_moving_average(grid_tq, smooth_win)
+    # Resample onto exactly npoints evenly spaced in RPM for a compact table.
+    lut_rpm = np.linspace(grid_rpm[0], grid_rpm[-1], npoints)
+    lut_tq = np.interp(lut_rpm, grid_rpm, grid_tq)
+    lut_tq = np.clip(lut_tq, 0.0, None)      # torque never negative for the demo
+    return lut_rpm, lut_tq
+
+
+def emit_header(path, src_name, lut_rpm, lut_tq, rpm_raw, tq_raw):
+    n = lut_rpm.size
+    peak_i = int(np.argmax(lut_tq))
+    guard = "SIM_TRACE_H"
+
+    def arr(vals, fmt="{:.2f}"):
+        body = ", ".join(fmt.format(float(v)) for v in vals)
+        # wrap ~8 per line for readability
+        out, line = [], []
+        for i, v in enumerate(vals):
+            line.append(fmt.format(float(v)))
+            if (i + 1) % 8 == 0:
+                out.append("  " + ", ".join(line) + ",")
+                line = []
+        if line:
+            out.append("  " + ", ".join(line) + ",")
+        return "\n".join(out)
+
+    txt = f"""// sim_trace.h  — AUTO-GENERATED by tools/gen_sim_trace.py.  DO NOT EDIT BY HAND.
+//
+// Torque-vs-RPM lookup for the firmware SIM ("virtual engine") bench demo.
+// Source run : {src_name}
+// Raw samples: {rpm_raw.size}  (RPM {rpm_raw.min():.0f}..{rpm_raw.max():.0f},
+//              torque {tq_raw.min():.1f}..{tq_raw.max():.1f}, median {np.median(tq_raw):.1f})
+// The SIM engine generates RPM from the run's state machine and looks up the
+// injected torque here, so the graphs replay the recorded run's torque as a
+// function of RPM.  Torque units match the source column (raw load-cell counts
+// for the 28 May run — uncalibrated; the demo shows relative behaviour).
+//
+#ifndef {guard}
+#define {guard}
+
+#include <Arduino.h>
+
+// Number of points in the torque-vs-RPM lookup table.
+static const uint16_t SIM_LUT_N = {n};
+
+// RPM breakpoints (monotonically increasing).
+static const float SIM_LUT_RPM[SIM_LUT_N] PROGMEM = {{
+{arr(lut_rpm, "{:.1f}")}
+}};
+
+// Torque at each RPM breakpoint (same unit as the source torque column).
+static const float SIM_LUT_TQ[SIM_LUT_N] PROGMEM = {{
+{arr(lut_tq, "{:.2f}")}
+}};
+
+// Convenience metadata.
+static const float SIM_RPM_MIN  = {lut_rpm[0]:.1f}f;
+static const float SIM_RPM_MAX  = {lut_rpm[-1]:.1f}f;
+static const float SIM_TQ_PEAK  = {lut_tq[peak_i]:.2f}f;
+static const float SIM_TQ_PEAK_RPM = {lut_rpm[peak_i]:.1f}f;
+
+// Linear-interpolate the recorded torque curve at an arbitrary RPM.
+// Clamps to the table ends.  Reads breakpoints from PROGMEM (ESP32 maps PROGMEM
+// to normal memory, but pgm_read keeps it portable to AVR test builds).
+static inline float simTorqueForRpm(float rpm) {{
+  float r0 = pgm_read_float(&SIM_LUT_RPM[0]);
+  if (rpm <= r0) return pgm_read_float(&SIM_LUT_TQ[0]);
+  for (uint16_t i = 1; i < SIM_LUT_N; ++i) {{
+    float ri = pgm_read_float(&SIM_LUT_RPM[i]);
+    if (rpm <= ri) {{
+      float rp = pgm_read_float(&SIM_LUT_RPM[i - 1]);
+      float t0 = pgm_read_float(&SIM_LUT_TQ[i - 1]);
+      float t1 = pgm_read_float(&SIM_LUT_TQ[i]);
+      float f  = (ri > rp) ? (rpm - rp) / (ri - rp) : 0.0f;
+      return t0 + f * (t1 - t0);
+    }}
+  }}
+  return pgm_read_float(&SIM_LUT_TQ[SIM_LUT_N - 1]);
+}}
+
+#endif // {guard}
+"""
+    with open(path, "w", newline="\n") as f:
+        f.write(txt)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--input", default="Dyno run 28 May 2025 smooth.xlsx",
+                    help="recorded run (.xlsx / .csv / .txt)")
+    ap.add_argument("--output", default="firmware/dyno_esp32s3/sim_trace.h")
+    ap.add_argument("--points", type=int, default=64, help="lookup table size")
+    ap.add_argument("--bin", type=float, default=100.0, help="RPM bin step")
+    ap.add_argument("--smooth", type=int, default=5, help="MA window over bins")
+    args = ap.parse_args()
+
+    rpm, tq = _load_rpm_torque(args.input)
+    lut_rpm, lut_tq = build_curve(rpm, tq, bin_step=args.bin,
+                                  smooth_win=args.smooth, npoints=args.points)
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    emit_header(args.output, os.path.basename(args.input), lut_rpm, lut_tq, rpm, tq)
+    print(f"Wrote {args.output}")
+    print(f"  source        : {args.input}")
+    print(f"  raw samples   : {rpm.size}  (RPM {rpm.min():.0f}..{rpm.max():.0f})")
+    print(f"  lookup points : {lut_rpm.size}  (RPM {lut_rpm[0]:.0f}..{lut_rpm[-1]:.0f})")
+    i = int(np.argmax(lut_tq))
+    print(f"  peak torque   : {lut_tq[i]:.2f} @ {lut_rpm[i]:.0f} RPM (source units)")
+
+
+if __name__ == "__main__":
+    main()

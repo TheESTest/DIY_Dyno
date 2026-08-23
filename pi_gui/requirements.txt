@@ -1,0 +1,7 @@
+pyserial>=3.5
+matplotlib>=3.7
+numpy>=1.24
+
+# Optional: only needed to load/replay .xlsx runs directly (e.g.
+# "Dyno run 28 May 2025 smooth.xlsx"). CSV/TXT logs work without it.
+openpyxl>=3.1
