@@ -110,7 +110,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.2.0"
+UI_VERSION = "1.2.2"
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dyno_runs")
 
@@ -1152,7 +1152,11 @@ class DynoApp:
         self._labelled_entry(tw, "Slew limit:", self.cfg_vars["rpm_slew"],
                              label_width=22, suffix="RPM/s (0 = off)")
         self._labelled_entry(tw, "Average over:", self.cfg_vars["rpm_avg"],
-                             label_width=22, suffix="pulses (1 = none)")
+                             label_width=22, suffix="pulses, max 500")
+        # This average feeds the PID, so a long window is not free. Showing
+        # the lag in seconds makes the cost visible where the choice is made.
+        self.rpm_lag_label = ttk.Label(tw, text="", foreground="gray")
+        self.rpm_lag_label.pack(anchor=tk.W, padx=(26, 4))
         ttk.Label(tw, wraplength=380, justify=tk.LEFT, foreground="gray",
                   text=("The band is the important one: a reading outside it is "
                         "discarded rather than averaged in, and its upper end also "
@@ -1809,6 +1813,81 @@ class DynoApp:
         self._send(f"CAL_ARM,{self.cfg_vars['lever_arm'].get()}")
         self._send(f"CAL_MECH,{self.cfg_vars['mech_ratio'].get()}")
 
+    # Limits copied from the firmware's own command handlers. Checking here
+    # means a bad value is caught where it was typed, instead of being saved
+    # into a profile and only surfacing as a controller error much later.
+    CFG_LIMITS = [
+        ("teeth",          "Pulses per rev",    "int",   1, 60),
+        ("drive_ratio",    "Drive ratio",       "float", 1e-9, None),
+        ("rpm_band_min",   "Valid RPM band min", "float", 0, None),
+        ("rpm_band_max",   "Valid RPM band max", "float", 0, None),
+        ("rpm_extrap_n",   "Extrapolation fit points", "int", 2, 10),
+        ("rpm_extrap_max", "Extrapolation max run",    "int", 1, 50),
+        ("rpm_avg",        "Average over",      "int",   1, 500),
+        ("rpm_slew",       "Slew limit",        "float", 0, None),
+    ]
+
+    def _validate_cfg(self):
+        """Return a list of human-readable problems with the current settings."""
+        problems = []
+        for key, label, kind, lo, hi in self.CFG_LIMITS:
+            raw = self.cfg_vars[key].get().strip()
+            try:
+                val = int(raw) if kind == "int" else float(raw)
+            except ValueError:
+                problems.append(f"{label}: {raw!r} is not a number")
+                continue
+            if lo is not None and val < lo:
+                problems.append(f"{label}: {raw} is below the minimum of {lo:g}")
+            elif hi is not None and val > hi:
+                problems.append(f"{label}: {raw} is above the maximum of {hi:g}")
+        # Cross-field rules the firmware also enforces.
+        try:
+            lo = float(self.cfg_vars["rpm_band_min"].get())
+            hi = float(self.cfg_vars["rpm_band_max"].get())
+            if hi <= lo + 100:
+                problems.append(
+                    f"Valid RPM band: max ({hi:g}) must be at least 100 above "
+                    f"min ({lo:g})")
+        except ValueError:
+            pass
+        if self.cfg_vars["rpm_median"].get().strip() not in ("1", "3", "5", "7"):
+            problems.append("Median window: must be 1, 3, 5 or 7")
+        try:
+            r = float(self.cfg_vars["rpm_ratio"].get())
+            if r != 0.0 and r <= 1.0:
+                problems.append("Ratio gate: must be 0 (off) or greater than 1")
+        except ValueError:
+            problems.append("Ratio gate: not a number")
+        return problems
+
+    def _rpm_avg_lag_s(self):
+        """Seconds of averaging lag at the RPM we are actually running at.
+
+        This average feeds the PID, so the window is not free: the loop is
+        answering an RPM the engine had this long ago.
+        """
+        try:
+            n = int(self.cfg_vars["rpm_avg"].get())
+            ppr = int(self.cfg_vars["teeth"].get())
+        except ValueError:
+            return None
+        with self._lock:
+            rpm = self.live["rpm"]
+        if rpm < 100:
+            # Not running: fall back to whatever this run is aimed at, so
+            # the figure still means something while setting up.
+            for key in ("hold_rpm", "start_rpm"):
+                try:
+                    rpm = float(self.param_vars[key].get())
+                    if rpm >= 100:
+                        break
+                except (KeyError, ValueError):
+                    rpm = 0.0
+        if rpm < 100 or ppr < 1 or n < 1:
+            return None
+        return n / (rpm * ppr / 60.0)
+
     def _send_rpm_cfg(self):
         self._send(f"TEETH,{self.cfg_vars['teeth'].get()}")
         self._send(f"RATIO,{self.cfg_vars['drive_ratio'].get()}")
@@ -1944,6 +2023,17 @@ class DynoApp:
         """Push every setting to the controller — use after a reconnect."""
         if not (self.ser and self.ser.is_open):
             messagebox.showinfo("Not connected", "Connect to the ESP32 first.")
+            return
+        problems = self._validate_cfg()
+        if problems:
+            # Sending anyway would half-apply the configuration and bury the
+            # reason in a stream of controller errors.
+            messagebox.showerror(
+                "Settings out of range",
+                "These will be rejected by the controller, so nothing was "
+                "sent:\n\n  - " + "\n  - ".join(problems) +
+                "\n\nFix them and send again.")
+            self._log_event("Send all aborted: " + "; ".join(problems), "err")
             return
         self._send_load_cell_cfg()
         self._send_rpm_cfg()
@@ -2861,6 +2951,16 @@ class DynoApp:
             text=str(es), foreground=("#B9770E" if es else "black"))
         # Firmware too old to answer VERSION is flagged rather than left
         # blank: it also predates fields this GUI expects.
+        lag = self._rpm_avg_lag_s()
+        if lag is None:
+            self.rpm_lag_label.config(text="", foreground="gray")
+        else:
+            # A control loop answering half-second-old RPM is already sluggish;
+            # past a second it is fighting the engine rather than following it.
+            self.rpm_lag_label.config(
+                text=f"= {lag:.2f} s of lag into the PID at this RPM"
+                     + ("  - too slow to control on" if lag > 0.5 else ""),
+                foreground=("#B03A2E" if lag > 0.5 else "gray"))
         self.status_labels["fw_version"].config(
             text=self.fw_version,
             foreground=("#B9770E" if self.fw_version == "unknown" else "black"))

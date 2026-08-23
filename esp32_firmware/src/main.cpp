@@ -68,7 +68,7 @@
 // Firmware version. Bump the minor when the serial protocol changes shape
 // (a new DATA field, a renamed command) so a mismatched GUI is diagnosable
 // from the log rather than from guesswork about which build is on the board.
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.2.2"
 
 // ─────────────────────────────────────────────────────────────────────
 // STEPPER ENCODER - TBD, HARDWARE NOT FITTED
@@ -108,7 +108,11 @@ static void updateEncoder() {
 // Averaging is capped only by RAM (200 floats is 800 bytes). Long windows are
 // smooth but slow: 100 pulses on a 3-tooth wheel is 33 revolutions, which at
 // 3000 RPM is two thirds of a second of lag inside the control loop.
-#define RPM_AVG_MAX          200     // Capacity of the RPM average buffer
+// 500 floats is 2 kB, which this board can spare. Note the cost is not
+// memory but phase lag: this average feeds the PID, so a long window means
+// the loop is answering an RPM the engine had some time ago. The GUI shows
+// that lag in seconds next to the field.
+#define RPM_AVG_MAX          500     // Capacity of the RPM average buffer
 #define DEFAULT_RPM_AVG      3       // Pulses averaged (runtime: RPM_AVG,<n>)
 #define TORQUE_AVG_SIZE      10      // Rolling average window for torque
 #define DATA_REPORT_MS       50      // Data report interval (20 Hz)
@@ -252,10 +256,12 @@ volatile uint32_t minPulseIntervalUs = 2500;
 volatile uint32_t tachGlitches       = 0;
 
 float    rpmBuffer[RPM_AVG_MAX];
-uint8_t  rpmBufIdx   = 0;
-uint8_t  rpmBufCount = 0;
+// uint16_t throughout: the window can now be 500 samples, and a uint8_t
+// silently wraps a requested 500 to 244.
+uint16_t rpmBufIdx   = 0;
+uint16_t rpmBufCount = 0;
 float    currentRPM  = 0.0f;
-uint8_t  rpmAvgSize  = DEFAULT_RPM_AVG;   // RPM_AVG,<n>
+uint16_t rpmAvgSize  = DEFAULT_RPM_AVG;   // RPM_AVG,<n>
 
 // Live RPM conditioning, ahead of the control loop.  Electrical noise on the
 // pickup reads as a genuine RPM change, and the PID answers it by moving the
@@ -296,8 +302,8 @@ float    driveRatio    = 1.0f;            // RATIO,<r> — engine rev per sensor
 // Load Cell / Torque
 // =============================================
 float    torqueBuffer[TORQUE_AVG_SIZE];
-uint8_t  torqueBufIdx   = 0;
-uint8_t  torqueBufCount = 0;
+uint16_t torqueBufIdx   = 0;
+uint16_t torqueBufCount = 0;
 float    currentTorque   = 0.0f;
 float    loadCellRaw_mV  = 0.0f;  // Raw ADC millivolts from load cell channel
 float    loadCellScale   = 1.0f;  // Converts mV to force (N)      — CAL_SCALE
@@ -512,14 +518,14 @@ static void applyPressureGain() {
 // =============================================
 // Rolling Average Helper
 // =============================================
-static float addToAvg(float* buf, uint8_t &idx, uint8_t &count,
-                      uint8_t maxSize, float value) {
+static float addToAvg(float* buf, uint16_t &idx, uint16_t &count,
+                      uint16_t maxSize, float value) {
     buf[idx] = value;
     idx = (idx + 1) % maxSize;
     if (count < maxSize) count++;
 
     float sum = 0.0f;
-    for (uint8_t i = 0; i < count; i++) sum += buf[i];
+    for (uint16_t i = 0; i < count; i++) sum += buf[i];
     return sum / (float)count;
 }
 
@@ -672,7 +678,7 @@ static void updateRPM() {
         pushRpmHistory(lastPulse, instantRPM);
     }
 
-    uint8_t avg = rpmAvgSize;
+    uint16_t avg = rpmAvgSize;
     if (avg < 1) avg = 1;
     if (avg > RPM_AVG_MAX) avg = RPM_AVG_MAX;
     currentRPM = addToAvg(rpmBuffer, rpmBufIdx, rpmBufCount, avg, instantRPM);
@@ -1343,7 +1349,7 @@ static void processCommand(const char* cmd) {
     if (s.startsWith("RPM_AVG,")) {
         int n = s.substring(8).toInt();
         if (n >= 1 && n <= RPM_AVG_MAX) {
-            rpmAvgSize  = (uint8_t)n;
+            rpmAvgSize  = (uint16_t)n;
             rpmBufCount = 0;          // old samples belong to the previous window
             rpmBufIdx   = 0;
         } else {
