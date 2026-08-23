@@ -138,6 +138,37 @@ try:
     check("no leftover temporary files",
           [f for f in os.listdir(work) if f.endswith(".new")], [])
 
+
+    # ── a read-only target stops it before anything is fetched ────────────
+    # This is what a GUI previously run under sudo leaves behind: root-owned
+    # files an ordinary user cannot replace.
+    import stat as _stat
+    fetched = []
+    def counting_fetch(path):
+        fetched.append(path)
+        return fake_fetch(path)
+    app._remote_bytes = counting_fetch
+    target = os.path.join(work, "dyno_gui.py")
+    os.chmod(target, _stat.S_IRUSR)          # read-only for the owner
+    try:
+        readonly = (not os.access(target, os.W_OK))
+    except Exception:
+        readonly = False
+    if readonly:                              # root ignores the bit; skip if so
+        shown.clear(); fetched.clear()
+        app._update_from_github()
+        check("read-only target reported",
+              any(x[0] == "error" for x in shown), True)
+        check("names the file", any("dyno_gui.py" in x[2] for x in shown), True)
+        check("explains the sudo cause", any("sudo" in x[2] for x in shown), True)
+        check("and nothing was downloaded", fetched, [])
+    else:
+        print("  skip  read-only check (running as root)")
+    os.chmod(target, _stat.S_IRUSR | _stat.S_IWUSR)
+    check("writable again once the mode is restored",
+          app._unwritable_targets(), [])
+    app._remote_bytes = fake_fetch
+
     # ── a repository that cannot be reached changes nothing ───────────────
     def dead(path):
         raise OSError("network is unreachable")

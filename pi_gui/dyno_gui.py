@@ -148,7 +148,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.5.0"
+UI_VERSION = "1.5.1"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at
@@ -164,6 +164,8 @@ UPDATE_REPO = "TheESTest/DIY_Dyno"
 UPDATE_BRANCH = "main"
 UPDATE_RAW = "https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 UPDATE_TIMEOUT_S = 30
+NL = chr(10)
+NL2 = chr(10) + chr(10)
 
 # (path in the repository, filename on this machine). Tests come too: they
 # are how the operator can check an update before trusting it.
@@ -2564,6 +2566,18 @@ class DynoApp:
         return (self._version_in(gui, "UI_VERSION"),
                 self._version_in(fw, "#define FW_VERSION"))
 
+    def _unwritable_targets(self):
+        """Files or directories an update needs, that cannot be written."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        bad = []
+        if not os.access(here, os.W_OK):
+            bad.append(here + "  (directory)")
+        for _path, name in UPDATE_PY_FILES + UPDATE_ASSET_FILES:
+            target = os.path.join(here, name)
+            if os.path.exists(target) and not os.access(target, os.W_OK):
+                bad.append(target)
+        return bad
+
     def _update_blocked_reason(self):
         """Why an update must not run right now, or None if it may."""
         if self.recording:
@@ -2590,6 +2604,22 @@ class DynoApp:
                 "Not now",
                 f"An update cannot run while {blocked}.\n\n"
                 "Finish or stop what is running first.")
+            return
+
+        # Check we can actually write before fetching anything. Running the
+        # program under sudo leaves these files owned by root, and a later run
+        # as an ordinary user would otherwise discover that only after
+        # downloading, with some files already replaced.
+        unwritable = self._unwritable_targets()
+        if unwritable:
+            messagebox.showerror(
+                "Cannot write here",
+                "These cannot be written by the current user:" + NL2
+                + "  - " + ("" + NL + "  - ").join(unwritable) + NL2
+                + "They are most likely owned by root because the program was "
+                  "previously run with sudo. Either run this the same way, or "
+                  "hand the files back with:" + NL2 +
+                "    sudo chown -R $USER ~/dyno")
             return
 
         self.update_btn.config(state=tk.DISABLED)
