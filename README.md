@@ -6,7 +6,7 @@ a stepper-actuated hydraulic brake.
 
 | Component | Version | Location |
 |---|---|---|
-| Raspberry Pi UI | 1.11.0 | [`pi_gui/`](pi_gui/) |
+| Raspberry Pi UI | 1.12.0 | [`pi_gui/`](pi_gui/) |
 | ESP32-S3 firmware | 1.7.0 | [`esp32_firmware/`](esp32_firmware/) |
 
 Both versions are recorded in the `_conditions.json` file saved beside every
@@ -110,6 +110,22 @@ serial port to be disconnected and a deliberate confirmation, because it reboots
 the controller holding the brake. `esp32_firmware/build/firmware.bin` is the
 binary it fetches; rebuild and commit it alongside `main.cpp` so the two never
 disagree.
+
+## Publishing runs
+
+Every finished test and every calibration sweep is published to `data/` in this
+repository automatically: the run CSV, its conditions file, the filtered curve
+and any plot. A run finishes whether or not the network happens to be up, so
+anything that cannot be sent is queued to disk and goes with the next attempt
+rather than being lost to a red status line.
+
+It needs a token with `Contents: write` on this repository, in
+`DYNO_GITHUB_TOKEN` or a local `dyno_github_token.txt` (git-ignored). The token
+is read only when uploading and is scrubbed from every error path — it never
+reaches a dialog, the event log, a profile or a conditions file.
+
+**This repository is public.** Anything published here is readable by anyone,
+including the free-text notes recorded with a run.
 
 ## Running it
 

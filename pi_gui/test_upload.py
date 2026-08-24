@@ -8,6 +8,7 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import dyno_gui
 import tempfile as _tf, os as _os
 dyno_gui.SESSION_FILE = _os.path.join(_tf.mkdtemp(), "session.json")
+dyno_gui.UPLOAD_PENDING_FILE = _os.path.join(_tf.mkdtemp(), "pending.json")
 from dyno_gui import messagebox
 
 fails = []
@@ -123,26 +124,99 @@ cond = os.path.join(d, "c.json")
 app._write_conditions(cond, base + ".csv")
 check("token not in a conditions file", TOKEN in open(cond).read(), False)
 
-# --- auto-upload is off unless asked for --------------------------------
-check("auto-upload off by default", app.cfg_vars["auto_upload"].get(), False)
+# --- publishing every test is the default -------------------------------
+check("auto-upload on by default", app.cfg_vars["auto_upload"].get(), True)
+os.environ[dyno_gui.UPLOAD_TOKEN_ENV] = TOKEN
+dyno_gui.UPLOAD_TOKEN_FILE = os.path.join(d, "tok.txt")
+app._upload_pending = []
 put.clear()
 app._maybe_auto_upload(base + ".csv")
-check("nothing published while it is off", put, [])
-app.cfg_vars["auto_upload"].set(True)
-put.clear()
-app._maybe_auto_upload(base + ".csv")
-check("published once switched on", len(put), 3)
+check("a finished run publishes itself", len(put), 3)
+check("nothing left owed", app._upload_pending, [])
 
-# with auto-upload on but no token, it says so rather than failing silently
-os.environ.pop(dyno_gui.UPLOAD_TOKEN_ENV)
-dyno_gui.UPLOAD_TOKEN_FILE = os.path.join(d, "gone.txt")
+# a sweep is a test too
+sweep = os.path.join(d, "brake_char_20260823_121000")
+for suffix in (".csv", "_conditions.json", ".png"):
+    with open(sweep + suffix, "w") as f:
+        f.write("x")
+put.clear()
+app._maybe_auto_upload(sweep + ".csv")
+check("a calibration sweep publishes too", len(put), 3)
+check("including its plot",
+      any(p.endswith(".png") for _t, p, _n, _m in put), True)
+
+# turning it off stops it
+app.cfg_vars["auto_upload"].set(False)
+put.clear()
+app._maybe_auto_upload(base + ".csv")
+check("respects the switch when off", put, [])
+app.cfg_vars["auto_upload"].set(True)
+
+# --- a run that finishes while the link is down is not lost -------------
+def offline(token, path, blob, message):
+    raise OSError("network is unreachable")
+app._github_put = offline
+app._upload_pending = []
 put.clear(); shown.clear()
 app._maybe_auto_upload(base + ".csv")
-check("no token, nothing sent", put, [])
-check("and the operator is told",
-      "no token" in app.upload_status.cget("text").lower(), True)
-check("without a popup mid-run", [x for x in shown if x[0] == "error"], [])
+check("nothing uploaded while offline", put, [])
+check("but the files are owed", len(app._upload_pending), 3)
+check("said so without a popup", [x for x in shown if x[0] == "error"], [])
+check("and the status line says they are waiting",
+      "waiting" in app.upload_status.cget("text"), True)
+check("the queue is on disk", os.path.exists(dyno_gui.UPLOAD_PENDING_FILE), True)
+
+# it survives a restart
+app._upload_pending = []
+app._load_pending()
+check("queue reloaded after a restart", len(app._upload_pending), 3)
+
+# and goes up with the next successful run
+app._github_put = fake_put
+put.clear()
+app._maybe_auto_upload(sweep + ".csv")
+check("the backlog goes with the next test", len(put), 6)
+check("nothing left owed", app._upload_pending, [])
+check("and the queue file is gone",
+      os.path.exists(dyno_gui.UPLOAD_PENDING_FILE), False)
+
+# --- no token: queued, never dropped ------------------------------------
+os.environ.pop(dyno_gui.UPLOAD_TOKEN_ENV)
+dyno_gui.UPLOAD_TOKEN_FILE = os.path.join(d, "absent.txt")
+app._upload_pending = []
+put.clear(); shown.clear()
+app._maybe_auto_upload(base + ".csv")
+check("no token means nothing sent", put, [])
+check("but still owed", len(app._upload_pending), 3)
+check("and no popup mid-run", [x for x in shown if x[0] == "error"], [])
 os.environ[dyno_gui.UPLOAD_TOKEN_ENV] = TOKEN
+put.clear()
+done, problems = app._flush_pending()
+check("they go once a token appears", done, 3)
+
+# a file deleted since is dropped rather than retried for ever
+app._upload_pending = [os.path.join(d, "gone_forever.csv")]
+done, problems = app._flush_pending()
+check("a vanished file is not retried", app._upload_pending, [])
+
+# --- the Publish button clears the backlog too --------------------------
+# The backlog is a file from an earlier run, not part of the latest one, so
+# the press has to carry both.
+app._upload_pending = [base + "_conditions.json"]
+put.clear(); shown.clear()
+answer[0] = True
+app._upload_latest()
+names = sorted(p.split("/")[-1] for _t, p, _n, _m in put)
+check("the latest sweep went up",
+      "brake_char_20260823_121000.csv" in names, True)
+check("and the older file owed from before",
+      "dyno_run_20260823_120000_conditions.json" in names, True)
+check("nothing left owed", app._upload_pending, [])
+
+# the same file queued twice is only sent once
+app._upload_pending = []
+app._queue_for_upload([base + ".csv", base + ".csv"])
+check("the queue does not duplicate", len(app._upload_pending), 1)
 
 # --- an oversized file is refused, not truncated ------------------------
 big = os.path.join(d, "dyno_run_20260823_130000.csv")

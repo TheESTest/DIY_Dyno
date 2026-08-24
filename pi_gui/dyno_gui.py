@@ -157,7 +157,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.11.0"
+UI_VERSION = "1.12.0"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at
@@ -196,6 +196,12 @@ UPLOAD_TOKEN_ENV = "DYNO_GITHUB_TOKEN"
 UPLOAD_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "dyno_github_token.txt")
 UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+# Files that could not be published yet. A run finishes whether or not the
+# network happens to be up, and a dropped connection must not be the reason
+# a test never reaches the team - so failures queue here and go on the next
+# attempt rather than being lost with a red status line.
+UPLOAD_PENDING_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "dyno_upload_pending.json")
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dyno_runs")
 
@@ -318,6 +324,7 @@ class DynoApp:
         # scale' made every alternation between the two rescale the gains
         # again, compounding without bound.
         self._gain_span = None
+        self._upload_pending = []          # files still owed to the repo
 
         # Readiness flags (from ESP). "sim" starts True so an unknown board is
         # treated as suspect until it tells us otherwise — the safe default is
@@ -407,7 +414,7 @@ class DynoApp:
             "rpm_source":     tk.StringVar(value=RPM_SOURCES[1]),
             "rpm_count_ms":   tk.StringVar(value="100"),
             "pulse_secs":     tk.StringVar(value="10"),
-            "auto_upload":    tk.BooleanVar(value=False),
+            "auto_upload":    tk.BooleanVar(value=True),
             # Brake sweep stall watch
             "char_stop_on_stall": tk.BooleanVar(value=False),
             # Stepper encoder - hardware not fitted yet, see the TBD panel
@@ -483,6 +490,7 @@ class DynoApp:
         self._update_drivetrain()
         self._update_count_window()
         self._gain_span = self._current_span()
+        self._load_pending()
         self._update_gain_meaning()
         self._factory_defaults = self._profile_snapshot()
         self._session_written = None
@@ -1756,7 +1764,7 @@ class DynoApp:
         drow.pack(fill=tk.X, padx=4, pady=(8, 2))
         ttk.Button(drow, text="Publish latest run", width=22,
                    command=self._upload_latest).pack(side=tk.LEFT)
-        ttk.Checkbutton(drow, text="publish every saved run",
+        ttk.Checkbutton(drow, text="publish every run and sweep",
                         variable=self.cfg_vars["auto_upload"]).pack(
                             side=tk.LEFT, padx=8)
         self.upload_status = ttk.Label(sf, text="", foreground="gray",
@@ -3263,8 +3271,11 @@ class DynoApp:
             return
         self.upload_status.config(text="uploading...", foreground="gray")
         self.root.update_idletasks()
-        done, problems = self._upload_files(paths)
-        self._report_upload(done, problems, len(paths))
+        # Anything owed from earlier goes with it, so one press clears the lot.
+        self._queue_for_upload(paths)
+        want = len(self._upload_pending)
+        done, problems = self._flush_pending(quiet=False)
+        self._report_upload(done, problems, want)
 
     def _report_upload(self, done, problems, total):
         if problems:
@@ -3285,20 +3296,92 @@ class DynoApp:
             self._log_event(f"Uploaded {done} files to "
                             f"{UPDATE_REPO}/{UPLOAD_DIR}", "ack")
 
-    def _maybe_auto_upload(self, base):
-        """Publish a just-saved run, if the operator asked for that."""
-        if not self.cfg_vars["auto_upload"].get():
-            return
-        if not self._github_token():
+    def _load_pending(self):
+        """Anything a previous session could not publish."""
+        try:
+            with open(UPLOAD_PENDING_FILE) as f:
+                got = json.load(f)
+            self._upload_pending = [p for p in got if os.path.exists(p)]
+        except (OSError, ValueError):
+            self._upload_pending = []
+        if self._upload_pending:
             self.upload_status.config(
-                text="auto-upload is on but no token is configured",
+                text=f"{len(self._upload_pending)} files still to publish - "
+                     "they go with the next run, or press Publish latest run",
                 foreground="#B9770E")
+
+    def _save_pending(self):
+        try:
+            if self._upload_pending:
+                with open(UPLOAD_PENDING_FILE, "w") as f:
+                    json.dump(self._upload_pending, f, indent=2)
+            elif os.path.exists(UPLOAD_PENDING_FILE):
+                os.remove(UPLOAD_PENDING_FILE)
+        except OSError:
+            pass                    # never let bookkeeping break a run
+
+    def _queue_for_upload(self, paths):
+        for p in paths:
+            if p not in self._upload_pending:
+                self._upload_pending.append(p)
+        self._save_pending()
+
+    def _flush_pending(self, quiet=True):
+        """Try everything owed. Whatever fails stays queued for next time."""
+        if not self._upload_pending:
+            return 0, []
+        if not self._github_token():
+            if not quiet:
+                self._upload_files([])          # shows the how-to-get-a-token dialog
+            self.upload_status.config(
+                text=f"{len(self._upload_pending)} files waiting - no token "
+                     "configured", foreground="#B9770E")
+            return 0, ["no token"]
+        still, done, problems = [], 0, []
+        for p in list(self._upload_pending):
+            if not os.path.exists(p):
+                continue                        # deleted since; nothing owed
+            d, probs = self._upload_files([p], quiet=True)
+            if d:
+                done += 1
+            else:
+                still.append(p)
+                problems.extend(probs)
+        self._upload_pending = still
+        self._save_pending()
+        return done, problems
+
+    def _maybe_auto_upload(self, base):
+        """Publish a just-finished test or sweep, with anything still owed.
+
+        Queued before any network is attempted, so a run that finishes while
+        the link is down is still owed to the repository rather than forgotten.
+        """
+        if not self.cfg_vars["auto_upload"].get():
             return
         paths = self._files_for(base)
         if not paths:
             return
-        done, problems = self._upload_files(paths, quiet=True)
-        self._report_upload(done, problems, len(paths))
+        self._queue_for_upload(paths)
+        if not self._github_token():
+            self.upload_status.config(
+                text=f"{len(self._upload_pending)} files waiting to publish - "
+                     "no token configured", foreground="#B9770E")
+            return
+        want = len(self._upload_pending)
+        done, problems = self._flush_pending()
+        if problems and problems != ["no token"]:
+            # Reported in the status line rather than a dialog: a run has just
+            # ended and the operator may be busy with the engine.
+            self.upload_status.config(
+                text=f"published {done}/{want}, {len(self._upload_pending)} "
+                     "still waiting - they go with the next run",
+                foreground="#B9770E")
+            self._log_event(
+                f"Upload: {done}/{want}; still owed "
+                f"{len(self._upload_pending)}: " + "; ".join(problems[:3]), "err")
+        else:
+            self._report_upload(done, [], want)
 
     def _update_from_github(self):
         """Fetch the current code from the repository and install it.
@@ -5053,6 +5136,8 @@ class DynoApp:
             messagebox.showerror("Could not save", str(e))
             return
         messagebox.showinfo("Saved", f"{n} rows saved to:\n{path}")
+        # A run saved by hand is as much a finished test as one that autosaved.
+        self._maybe_auto_upload(path)
 
     # ══════════════════════════════════════════════════════════
     # Analysis & Filtering
