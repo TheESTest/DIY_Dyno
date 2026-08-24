@@ -157,7 +157,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.12.0"
+UI_VERSION = "1.13.0"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at
@@ -203,7 +203,12 @@ UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 UPLOAD_PENDING_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "dyno_upload_pending.json")
 
-DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dyno_runs")
+# Everything the program generates lives under the folder it runs from, so a
+# dyno is one directory that can be copied, backed up or handed over whole.
+# A sibling folder looks the same in a file browser and is easy to set by
+# accident, which is why the setting says plainly where it actually points.
+PROGRAM_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DATA_DIR = os.path.join(PROGRAM_DIR, "dyno_runs")
 
 # Settings from the last session, reloaded on start so calibration and gains do
 # not have to be re-entered (or re-remembered) every time the program opens.
@@ -491,6 +496,7 @@ class DynoApp:
         self._update_count_window()
         self._gain_span = self._current_span()
         self._load_pending()
+        self._update_data_dir_note()
         self._update_gain_meaning()
         self._factory_defaults = self._profile_snapshot()
         self._session_written = None
@@ -1696,10 +1702,17 @@ class DynoApp:
         row = ttk.Frame(st)
         row.pack(fill=tk.X, padx=4, pady=(4, 1))
         ttk.Label(row, text="Folder:", width=10, anchor=tk.W).pack(side=tk.LEFT)
+        self.cfg_vars["data_dir"].trace_add(
+            "write", lambda *a: self._update_data_dir_note())
         ttk.Entry(row, textvariable=self.cfg_vars["data_dir"]).pack(
             side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(row, text="Browse…", width=9,
                    command=self._choose_data_dir).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="Reset", width=7,
+                   command=self._reset_data_dir).pack(side=tk.LEFT)
+        self.data_dir_note = ttk.Label(parent, text="", foreground="gray",
+                                       wraplength=380, justify=tk.LEFT)
+        self.data_dir_note.pack(anchor=tk.W, padx=6)
         self._labelled_entry(st, "Filename prefix:", self.cfg_vars["run_prefix"],
                              label_width=15, width=18)
         ttk.Checkbutton(st, text="Save every completed run automatically",
@@ -2887,6 +2900,36 @@ class DynoApp:
             self._send(f"CAM_PT,{i},{x},{y}")
         self._send(f"CAM_MODEL,{model}")
         self._send(f"CAM_LIN,{1 if self.cfg_vars['cam_lin'].get() else 0}")
+
+    @staticmethod
+    def data_dir_is_inside(folder):
+        """Is this folder under the one the program runs from?"""
+        try:
+            here = os.path.realpath(PROGRAM_DIR)
+            there = os.path.realpath(os.path.expanduser(folder.strip()))
+        except (OSError, ValueError):
+            return None
+        return there == here or there.startswith(here + os.sep)
+
+    def _update_data_dir_note(self, *_):
+        """Say whether runs are landing inside the program folder or beside it."""
+        folder = self.cfg_vars["data_dir"].get().strip() or DEFAULT_DATA_DIR
+        inside = self.data_dir_is_inside(folder)
+        if inside is None:
+            self.data_dir_note.config(text="", foreground="gray")
+        elif inside:
+            self.data_dir_note.config(
+                text="inside the program folder", foreground="#1E8449")
+        else:
+            self.data_dir_note.config(
+                text=("OUTSIDE the program folder - runs will not be part of "
+                      "the dyno directory. Use Reset to put them back."),
+                foreground="#B03A2E")
+
+    def _reset_data_dir(self):
+        self.cfg_vars["data_dir"].set(DEFAULT_DATA_DIR)
+        self._update_data_dir_note()
+        self._log_event(f"Run folder reset to {DEFAULT_DATA_DIR}", "ack")
 
     def _choose_data_dir(self):
         path = filedialog.askdirectory(
