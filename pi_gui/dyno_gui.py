@@ -34,6 +34,8 @@ import re
 import shutil
 import subprocess
 import urllib.request
+import urllib.error
+import base64
 
 import numpy as np
 import serial
@@ -155,7 +157,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.10.0"
+UI_VERSION = "1.11.0"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at
@@ -183,6 +185,17 @@ UPDATE_PY_FILES = [
 UPDATE_ASSET_FILES = [("pi_gui/centurial_logo.png", "centurial_logo.png")]
 UPDATE_FW_PATH = "esp32_firmware/build/firmware.bin"
 UPDATE_FW_SRC = "esp32_firmware/src/main.cpp"
+
+# Publishing recorded runs to the repository so the team can work on the
+# same data. The token is read from the environment or a local file and is
+# never written into a profile, a conditions file or the event log - those
+# are the things that get published.
+UPLOAD_DIR = "data"
+UPLOAD_API = "https://api.github.com/repos/{repo}/contents/{path}"
+UPLOAD_TOKEN_ENV = "DYNO_GITHUB_TOKEN"
+UPLOAD_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "dyno_github_token.txt")
+UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dyno_runs")
 
@@ -298,6 +311,13 @@ class DynoApp:
         self._pulses = []
         self._pulse_active = False
         self._pulse_ppr = 3
+        # The brake span the current gains were sized for. Kept explicitly
+        # because it cannot be inferred from the range fields: the drivetrain
+        # sets those to the mechanical travel and the effective-range finder
+        # sets them to the operating window, so reading them back as 'the old
+        # scale' made every alternation between the two rescale the gains
+        # again, compounding without bound.
+        self._gain_span = None
 
         # Readiness flags (from ESP). "sim" starts True so an unknown board is
         # treated as suspect until it tells us otherwise — the safe default is
@@ -387,6 +407,7 @@ class DynoApp:
             "rpm_source":     tk.StringVar(value=RPM_SOURCES[1]),
             "rpm_count_ms":   tk.StringVar(value="100"),
             "pulse_secs":     tk.StringVar(value="10"),
+            "auto_upload":    tk.BooleanVar(value=False),
             # Brake sweep stall watch
             "char_stop_on_stall": tk.BooleanVar(value=False),
             # Stepper encoder - hardware not fitted yet, see the TBD panel
@@ -461,6 +482,7 @@ class DynoApp:
         # default values to drift out of step with the real ones.
         self._update_drivetrain()
         self._update_count_window()
+        self._gain_span = self._current_span()
         self._update_gain_meaning()
         self._factory_defaults = self._profile_snapshot()
         self._session_written = None
@@ -1729,6 +1751,27 @@ class DynoApp:
         self.flash_btn.pack(side=tk.LEFT, padx=6)
         self.update_status = ttk.Label(sf, text="", foreground="gray")
         self.update_status.pack(anchor=tk.W, padx=4)
+
+        drow = ttk.Frame(sf)
+        drow.pack(fill=tk.X, padx=4, pady=(8, 2))
+        ttk.Button(drow, text="Publish latest run", width=22,
+                   command=self._upload_latest).pack(side=tk.LEFT)
+        ttk.Checkbutton(drow, text="publish every saved run",
+                        variable=self.cfg_vars["auto_upload"]).pack(
+                            side=tk.LEFT, padx=8)
+        self.upload_status = ttk.Label(sf, text="", foreground="gray",
+                                       wraplength=380, justify=tk.LEFT)
+        self.upload_status.pack(anchor=tk.W, padx=4)
+        ttk.Label(sf, wraplength=380, justify=tk.LEFT, foreground="gray",
+                  text=(f"Pushes the run CSV, its conditions file and any "
+                        f"plot to github.com/{UPDATE_REPO} under "
+                        f"{UPLOAD_DIR}/, so the team works from the same "
+                        "data. That repository is PUBLIC: anything "
+                        "published there, test notes included, is readable "
+                        "by anyone. Needs a token with write access in "
+                        f"{os.path.basename(UPLOAD_TOKEN_FILE)} or "
+                        f"{UPLOAD_TOKEN_ENV}.")
+                  ).pack(anchor=tk.W, padx=4, pady=(0, 4))
         ttk.Label(sf, wraplength=380, justify=tk.LEFT, foreground="gray",
                   text=(f"Fetches the interface and firmware from "
                         f"github.com/{UPDATE_REPO}. Downloaded code is compiled "
@@ -2076,6 +2119,11 @@ class DynoApp:
         if messagebox.askyesno("Effective range found", msg):
             self.cfg_vars["brake_min"].set(f"{res['takeup_steps']:.0f}")
             self.cfg_vars["brake_max"].set(f"{res['saturation_steps']:.0f}")
+            # Narrowing the loop's span changes what a given Kp is worth, so the
+            # gains are offered the same rescale the drivetrain would offer.
+            self._rescale_gains_for_span(
+                self._current_span(),
+                "The measured range is narrower than the full travel.")
             self._log_event(
                 f"Brake range set from {os.path.basename(path)}: "
                 f"{res['takeup_steps']:.0f}-{res['saturation_steps']:.0f} steps",
@@ -2259,6 +2307,7 @@ class DynoApp:
         # brake actually responds, so say so here rather than making the
         # operator re-open the file to find out.
         self._char_range = self._range_from_rows(rows)
+        self._maybe_auto_upload(base + ".csv")
         self.char_progress.config(text=f"Saved brake_char_{stamp}")
         self._log_event(f"Brake characterisation saved: brake_char_{stamp}"
                         f" ({len(rows)} samples)", "ack")
@@ -2667,6 +2716,55 @@ class DynoApp:
                   f" {d['cam_travel']:.0f} steps"),
             foreground="#1F618D")
 
+    def _current_span(self):
+        try:
+            return (float(self.cfg_vars["brake_max"].get())
+                    - float(self.cfg_vars["brake_min"].get()))
+        except ValueError:
+            return None
+
+    def _rescale_gains_for_span(self, new_span, why):
+        """Offer to move the gains onto a new brake span.
+
+        Measured against the span the gains were last sized for, never against
+        whatever the range fields happen to hold - those are written by two
+        different features and mean two different things.
+        """
+        old_span = self._gain_span
+        if old_span is None or old_span <= 0 or new_span is None or new_span <= 0:
+            self._gain_span = new_span
+            return False
+        factor = new_span / old_span
+        if abs(factor - 1.0) <= 0.01:
+            self._gain_span = new_span
+            return False
+        if not messagebox.askyesno(
+                "Rescale the gains?",
+                f"{why}" + NL + NL +
+                f"The brake span goes from {old_span:.0f} to {new_span:.0f} "
+                f"steps, a factor of {factor:.4g}." + NL + NL +
+                "Kp is steps of brake per RPM of error, so gains sized for the "
+                "old span are wrong by that factor against the new one"
+                + (" - too strong, which means the brake slams on for a small "
+                   "error." if factor < 1 else " - too weak to control with.")
+                + NL + NL + "Rescale the PID gains by "
+                f"{factor:.4g}?"):
+            # Declining still records the new span, or the next change would be
+            # measured from a baseline the gains no longer match.
+            self._gain_span = new_span
+            return False
+        for store in (self.pid_vars, self.pid_sweep_vars):
+            for k in ("kp", "ki", "kd"):
+                try:
+                    store[k].set(f"{float(store[k].get()) * factor:.6g}")
+                except (KeyError, ValueError):
+                    pass
+        self._gain_span = new_span
+        self._log_event(
+            f"Gains rescaled by {factor:.4g} for a brake span of "
+            f"{new_span:.0f} steps ({why})", "ack")
+        return True
+
     def _apply_drivetrain(self):
         """Put the derived travel into the brake range and the cam scale.
 
@@ -2679,60 +2777,37 @@ class DynoApp:
         if d is None:
             messagebox.showerror("Drivetrain", "Enter positive numbers first.")
             return
-        try:
-            old_travel = float(self.cfg_vars["brake_max"].get())
-        except ValueError:
-            old_travel = 0.0
         new_travel = round(d["cam_travel"])
-        factor = (new_travel / old_travel) if old_travel > 0 else 0.0
+        old_travel = self.cfg_vars["brake_max"].get()
 
-        msg = (f"Brake range max becomes {new_travel:g} steps "
-               f"(was {old_travel:g}), and the cam scale "
-               f"{d['per_degree']:.3f} steps per degree.")
-        rescale = False
-        if factor > 0 and abs(factor - 1.0) > 0.01:
-            rescale = messagebox.askyesno(
-                "Rescale gains and speeds too?",
-                msg + f"\n\nThat is a factor of {factor:.4g}.\n\n"
-                "PID gains are microsteps of brake per RPM of error, so they "
-                "belong to the old step scale. Leaving them alone would make "
-                "the loop wrong by that same factor"
-                + (" - far too strong, which means the brake slams on for a "
-                   "small error." if factor < 1 else " - far too weak to "
-                   "control with.") +
-                "\n\nRescale the PID gains, speed and acceleration by "
-                f"{factor:.4g} as well?")
-        else:
-            messagebox.showinfo("Drivetrain", msg)
+        # The step rates belong to the driver, not to the brake range, so they
+        # follow the drivetrain directly rather than through any span factor.
+        try:
+            steps_rev = float(self.cfg_vars["driver_steps"].get())
+            self.cfg_vars["step_speed"].set(f"{steps_rev * 2:.6g}")
+            self.cfg_vars["step_accel"].set(f"{steps_rev * 10:.6g}")
+        except ValueError:
+            pass
 
+        # brake_min is where the pads bite - a physical property of the linkage,
+        # measured by a sweep. It is not a scale factor and must not be scaled.
         self.cfg_vars["brake_max"].set(str(new_travel))
         self.cfg_vars["cam_spd"].set(f"{d['per_degree']:.4f}")
+        try:
+            if float(self.cfg_vars["brake_min"].get()) >= new_travel:
+                self.cfg_vars["brake_min"].set("0")
+        except ValueError:
+            self.cfg_vars["brake_min"].set("0")
 
-        if rescale:
-            for store, keys in ((self.pid_vars, ("kp", "ki", "kd")),
-                                (self.pid_sweep_vars, ("kp", "ki", "kd"))):
-                for k in keys:
-                    try:
-                        store[k].set(f"{float(store[k].get()) * factor:.6g}")
-                    except (KeyError, ValueError):
-                        pass
-            # brake_min is a step position, so it moves with the scale exactly
-            # as the travel does. Left behind, a min set for the old geometry
-            # can end up at or above the new max, which the controller refuses
-            # outright with "BRAKE_RANGE needs 0 <= min < max".
-            for k in ("step_speed", "step_accel", "brake_min"):
-                try:
-                    self.cfg_vars[k].set(
-                        f"{float(self.cfg_vars[k].get()) * factor:.6g}")
-                except ValueError:
-                    pass
-            self._log_event(
-                f"Drivetrain applied: travel {old_travel:g} -> {new_travel:g}, "
-                f"gains and speeds rescaled by {factor:.4g}", "ack")
-        else:
-            self._log_event(
-                f"Drivetrain applied: travel {old_travel:g} -> {new_travel:g}, "
-                "gains and speeds left alone", "ack")
+        messagebox.showinfo(
+            "Drivetrain",
+            f"Brake range max becomes {new_travel:g} steps (was {old_travel}), "
+            f"the cam scale {d['per_degree']:.3f} steps per degree, and the "
+            f"step rates {steps_rev * 2:.0f}/s and {steps_rev * 10:.0f}/s^2.")
+        self._rescale_gains_for_span(
+            self._current_span(), "The drivetrain changed the brake travel.")
+        self._log_event(
+            f"Drivetrain applied: travel {old_travel} -> {new_travel:g}", "ack")
 
         self._update_drivetrain()
         if self.ser and self.ser.is_open:
@@ -2903,6 +2978,7 @@ class DynoApp:
         data["pid_sweep"] = {k: v.get() for k, v in self.pid_sweep_vars.items()}
         data["run"] = {k: v.get() for k, v in self.param_vars.items()}
         data["units"] = self.units_var.get()
+        data["gain_span"] = self._gain_span
         data["cam_table"] = [[xv.get(), yv.get()] for xv, yv in self.cam_rows]
         for group, variables in self._profile_groups().items():
             data[group] = {k: v.get() for k, v in variables.items()}
@@ -2945,6 +3021,14 @@ class DynoApp:
         if data.get("units") in ("Nm", "lb-ft"):
             self.units_var.set(data["units"])
             self._on_units_changed()
+        # The gains belong to a span, so that baseline travels with them.
+        if data.get("gain_span") is not None:
+            try:
+                self._gain_span = float(data["gain_span"])
+            except (TypeError, ValueError):
+                pass
+        else:
+            self._gain_span = self._current_span()
         self._sync_brake_slider()
 
     # ── Session memory ───────────────────────────────────────
@@ -3030,6 +3114,191 @@ class DynoApp:
         if state not in ("", "IDLE", "MANUAL", "FAULT"):
             return f"the controller is in {state}"
         return None
+
+    # ── Publishing runs to the repository ────────────────────
+    @staticmethod
+    def _github_token():
+        """The token, from the environment or a local file. None if absent."""
+        tok = os.environ.get(UPLOAD_TOKEN_ENV, "").strip()
+        if tok:
+            return tok
+        try:
+            with open(UPLOAD_TOKEN_FILE) as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
+
+    @staticmethod
+    def _scrub(text, token):
+        """Never let a token reach a dialog, a log line or a saved file."""
+        s = str(text)
+        if token:
+            s = s.replace(token, "<token>")
+        return s
+
+    def _github_put(self, token, path, blob, message):
+        """Create or replace one file in the repository. Raises on failure."""
+        url = UPLOAD_API.format(repo=UPDATE_REPO, path=path)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"dyno-gui/{UI_VERSION}",
+        }
+        # An existing file needs its blob sha, or the API refuses the write.
+        sha = None
+        req = urllib.request.Request(url + f"?ref={UPDATE_BRANCH}",
+                                     headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT_S) as r:
+                sha = json.loads(r.read().decode("utf-8")).get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+        except OSError:
+            raise
+
+        body = {
+            "message": message,
+            "content": base64.b64encode(blob).decode("ascii"),
+            "branch": UPDATE_BRANCH,
+        }
+        if sha:
+            body["sha"] = sha
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"), headers=headers,
+            method="PUT")
+        with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT_S) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def _files_for(self, base):
+        """Every file belonging to one run or sweep, by its base path."""
+        stem = os.path.splitext(base)[0]
+        out = []
+        for suffix in (".csv", ".png", "_conditions.json", "_filtered.csv"):
+            p = stem + suffix
+            if os.path.exists(p) and p not in out:
+                out.append(p)
+        return out
+
+    def _upload_files(self, paths, quiet=False):
+        """Push a set of files. Returns (uploaded, [problems])."""
+        token = self._github_token()
+        if not token:
+            if not quiet:
+                messagebox.showerror(
+                    "No GitHub token",
+                    "Uploading needs a GitHub personal access token with "
+                    "repository write access." + NL + NL +
+                    f"Put it in {UPLOAD_TOKEN_FILE}" + NL +
+                    f"or set {UPLOAD_TOKEN_ENV} in the environment." + NL + NL +
+                    "It is read only when uploading and is never written into "
+                    "a profile, a run file or the log.")
+            return 0, ["no token"]
+
+        done, problems = 0, []
+        for p in paths:
+            try:
+                size = os.path.getsize(p)
+                if size > UPLOAD_MAX_BYTES:
+                    problems.append(f"{os.path.basename(p)}: too large "
+                                    f"({size / 1e6:.1f} MB)")
+                    continue
+                with open(p, "rb") as f:
+                    blob = f.read()
+                name = os.path.basename(p)
+                self._github_put(
+                    token, f"{UPLOAD_DIR}/{name}", blob,
+                    f"Add run data: {name}")
+                done += 1
+                self.upload_status.config(
+                    text=f"uploaded {done}/{len(paths)}...", foreground="gray")
+                self.root.update_idletasks()
+            except urllib.error.HTTPError as e:
+                detail = "forbidden - does the token have write access?" \
+                    if e.code in (401, 403) else f"HTTP {e.code}"
+                problems.append(f"{os.path.basename(p)}: {detail}")
+            except Exception as e:                    # network, disk, anything
+                problems.append(
+                    f"{os.path.basename(p)}: {self._scrub(e, token)}")
+        return done, problems
+
+    def _latest_run_base(self):
+        folder = self.cfg_vars["data_dir"].get().strip() or DEFAULT_DATA_DIR
+        best, best_t = None, -1.0
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return None
+        for n in names:
+            if not n.endswith(".csv") or n.endswith("_filtered.csv"):
+                continue
+            p = os.path.join(folder, n)
+            try:
+                t = os.path.getmtime(p)
+            except OSError:
+                continue
+            if t > best_t:
+                best, best_t = p, t
+        return best
+
+    def _upload_latest(self):
+        """Publish the most recent run or sweep, with everything beside it."""
+        base = self._latest_run_base()
+        if not base:
+            messagebox.showinfo("Nothing to upload",
+                                "No recorded runs found in the data folder.")
+            return
+        paths = self._files_for(base)
+        total = sum(os.path.getsize(p) for p in paths)
+        if not messagebox.askyesno(
+                "Publish this run?",
+                f"{len(paths)} files, {total / 1e6:.2f} MB:" + NL +
+                "  " + (NL + "  ").join(os.path.basename(p) for p in paths)
+                + NL + NL +
+                f"They go to github.com/{UPDATE_REPO} under {UPLOAD_DIR}/."
+                + NL + NL +
+                "That repository is PUBLIC, so anyone can read them - including "
+                "whatever is in the test notes. Do not upload anything you "
+                "would not publish." + NL + NL + "Upload?"):
+            return
+        self.upload_status.config(text="uploading...", foreground="gray")
+        self.root.update_idletasks()
+        done, problems = self._upload_files(paths)
+        self._report_upload(done, problems, len(paths))
+
+    def _report_upload(self, done, problems, total):
+        if problems:
+            self.upload_status.config(
+                text=f"{done}/{total} uploaded, {len(problems)} failed",
+                foreground="#B03A2E")
+            if problems != ["no token"]:
+                messagebox.showerror(
+                    "Some files did not upload",
+                    (NL).join(problems) + NL + NL +
+                    f"{done} of {total} were published.")
+            self._log_event(f"Upload: {done}/{total}, problems: "
+                            + "; ".join(problems), "err")
+        else:
+            self.upload_status.config(
+                text=f"{done} files published to {UPLOAD_DIR}/",
+                foreground="#1E8449")
+            self._log_event(f"Uploaded {done} files to "
+                            f"{UPDATE_REPO}/{UPLOAD_DIR}", "ack")
+
+    def _maybe_auto_upload(self, base):
+        """Publish a just-saved run, if the operator asked for that."""
+        if not self.cfg_vars["auto_upload"].get():
+            return
+        if not self._github_token():
+            self.upload_status.config(
+                text="auto-upload is on but no token is configured",
+                foreground="#B9770E")
+            return
+        paths = self._files_for(base)
+        if not paths:
+            return
+        done, problems = self._upload_files(paths, quiet=True)
+        self._report_upload(done, problems, len(paths))
 
     def _update_from_github(self):
         """Fetch the current code from the repository and install it.
@@ -4743,6 +5012,9 @@ class DynoApp:
                 self._log_event("Filtered curve not saved - no usable curve", "err")
         except (OSError, ValueError) as e:
             self._log_event(f"Filtered save failed: {e}", "err")
+
+        # Everything for this run is on disk now, so it can go up as a set.
+        self._maybe_auto_upload(path)
 
     def _save_and_restart(self):
         """Save the current pull and clear down ready for the next one."""

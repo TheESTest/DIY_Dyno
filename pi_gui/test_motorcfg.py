@@ -64,39 +64,46 @@ check("unusable entry says so",
       "positive numbers" in app.drivetrain_label.cget("text"), True)
 app.cfg_vars["driver_steps"].set("400")
 
-# --- applying it rescales the gains with the travel -----------------------
-app.cfg_vars["brake_max"].set("6250")          # pretend we are still on the old setup
+# --- applying it sets the travel, cam scale and step rates ---------------
+# The gain rescaling itself lives in _rescale_gains_for_span and is covered by
+# test_gainspan.py; what matters here is what the drivetrain writes.
+app.cfg_vars["brake_min"].set("0")
+app.cfg_vars["brake_max"].set("6250")      # pretend we are still on the old setup
+app._gain_span = 6250.0
 app.pid_vars["kp"].set("6.25"); app.pid_vars["ki"].set("10.0")
 app.pid_vars["kd"].set("0.25")
 app.pid_sweep_vars["kp"].set("3.75")
-app.cfg_vars["step_speed"].set("10000"); app.cfg_vars["step_accel"].set("50000")
 asked.clear()
 app._apply_drivetrain()
 check("travel taken from the drivetrain", app.cfg_vars["brake_max"].get(), "500")
 check("cam scale taken too", app.cfg_vars["cam_spd"].get(), "11.1111")
-check("asked before rescaling", len(asked), 1)
-check("said what the factor was", "0.08" in asked[0][1], True)
-check("warned it would be too strong", "slams on" in asked[0][1], True)
-check("hold Kp rescaled", float(app.pid_vars["kp"].get()), 0.5)
+check("step speed from the driver, not a span factor",
+      float(app.cfg_vars["step_speed"].get()), 800.0)
+check("acceleration likewise", float(app.cfg_vars["step_accel"].get()), 4000.0)
+check("asked before rescaling the gains", len(asked) >= 1, True)
+check("hold Kp rescaled to the new span", float(app.pid_vars["kp"].get()), 0.5)
 check("hold Ki rescaled", float(app.pid_vars["ki"].get()), 0.8)
 check("hold Kd rescaled", float(app.pid_vars["kd"].get()), 0.02)
 check("sweep Kp rescaled", float(app.pid_sweep_vars["kp"].get()), 0.3)
-check("speed rescaled", float(app.cfg_vars["step_speed"].get()), 800.0)
-check("acceleration rescaled", float(app.cfg_vars["step_accel"].get()), 4000.0)
+check("baseline now the new span", app._gain_span, 500.0)
 
-# same drivetrain again is not a change, so nothing is asked
+# the same drivetrain again is not a change, so nothing is asked and nothing moves
 asked.clear()
 app._apply_drivetrain()
 check("no rescale prompt when nothing changed", len(asked), 0)
 check("gains untouched", float(app.pid_vars["kp"].get()), 0.5)
 
-# --- declining the rescale leaves the gains alone -------------------------
+# --- declining leaves the gains but still records the span ---------------
 messagebox.askyesno = lambda t, m, **k: False
 app.cfg_vars["brake_max"].set("6250")
+app._gain_span = 6250.0
 app.pid_vars["kp"].set("6.25")
 app._apply_drivetrain()
 check("travel still applied when declined", app.cfg_vars["brake_max"].get(), "500")
 check("gains left alone when declined", float(app.pid_vars["kp"].get()), 6.25)
+check("but the baseline moved, so the next change is measured from it",
+      app._gain_span, 500.0)
+messagebox.askyesno = lambda t, m, **k: (asked.append((t, m)), True)[1]
 
 # --- the software panel ---------------------------------------------------
 check("interface version shown", dyno_gui.UI_VERSION in root.title(), True)
@@ -123,20 +130,23 @@ for k in ("motor_steps", "driver_steps", "gearbox", "cam_angle"):
     check(f"profile keeps {k}", k in snap, True)
 
 
-# --- brake_min is a step position, so it must scale with the travel -------
+# --- takeup is physical, so the drivetrain must NOT scale it -------------
+# Scaling it was the bug: it moved the measured bite point every time the
+# drivetrain was applied, and could push the minimum above the new maximum.
 messagebox.askyesno = lambda t, m, **k: True
 app.cfg_vars["brake_max"].set("6250")
-app.cfg_vars["brake_min"].set("1000")        # a real minimum on the old scale
-app.cfg_vars["step_speed"].set("10000"); app.cfg_vars["step_accel"].set("50000")
+app.cfg_vars["brake_min"].set("140")       # measured by a sweep, in steps
+app._gain_span = 6110.0
 app._apply_drivetrain()
-check("minimum rescaled with the travel",
-      float(app.cfg_vars["brake_min"].get()), 80.0)
+check("takeup left exactly where the sweep measured it",
+      app.cfg_vars["brake_min"].get(), "140")
+check("only the maximum follows the drivetrain",
+      app.cfg_vars["brake_max"].get(), "500")
 check("range still valid after the change",
       float(app.cfg_vars["brake_min"].get())
       < float(app.cfg_vars["brake_max"].get()), True)
 check("nothing the controller would reject", app._validate_cfg(), [])
 app.cfg_vars["brake_min"].set("0")
-
 
 # --- branding -------------------------------------------------------------
 import os as _o

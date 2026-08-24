@@ -14,3 +14,7 @@ dyno_last_session.json
 *.xlsx
 *.docx
 *.zip
+
+# Never commit the upload credential
+dyno_github_token.txt
+*token*.txt
