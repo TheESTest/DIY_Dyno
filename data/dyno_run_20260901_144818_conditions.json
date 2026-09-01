@@ -1,0 +1,166 @@
+{
+  "_saved": "2026-09-01 14:48:21",
+  "_run_file": "dyno_run_20260901_144818.csv",
+  "_note": "Test conditions for the run above. This is also a valid profile - load it to put the rig back exactly as it was.",
+  "_ui_version": "1.14.0",
+  "_fw_version": "1.7.0",
+  "_fw_build": "Aug 23 2026 11:23:07",
+  "_torque_units": "lb-ft",
+  "_torque_calibrated": true,
+  "_samples": 3238,
+  "_notes": "",
+  "_notes_edited": null,
+  "_brake_char_stall": null,
+  "_brake_effective_range": null,
+  "_controller_cfg": [],
+  "teeth": "3",
+  "drive_ratio": "1.0",
+  "rpm_band_min": "500",
+  "rpm_band_max": "6000",
+  "rpm_extrap": true,
+  "rpm_extrap_n": "4",
+  "rpm_extrap_max": "5",
+  "rpm_source": "1 - pulses counted per window",
+  "rpm_count_ms": "100",
+  "pulse_secs": "10",
+  "auto_upload": true,
+  "char_stop_on_stall": false,
+  "enc_enabled": false,
+  "enc_cpr": "4000",
+  "enc_invert": false,
+  "rpm_median": "1",
+  "rpm_ratio": "3.0",
+  "rpm_slew": "2000",
+  "rpm_avg": "50",
+  "motor_steps": "200",
+  "driver_steps": "400",
+  "gearbox": "10.0",
+  "cam_angle": "60",
+  "brake_min": "0",
+  "brake_max": "667",
+  "preload_pct": "20",
+  "rampdown_mode": "Controlled RPM ramp",
+  "rampdown_rate": "300",
+  "rampdown_brake": "40",
+  "cutoff_rpm": "1200",
+  "throttle_off": "50",
+  "stop_rate": "200",
+  "invert": true,
+  "step_speed": "157.006",
+  "step_accel": "78.5029",
+  "cam_model": "Linear (steps = brake)",
+  "cam_spd": "11.1111",
+  "cam_lin": false,
+  "cal_scale": "0.702351",
+  "lever_arm": "0.300",
+  "mech_ratio": "3.0",
+  "press_off_mv": "500.0",
+  "press_psi_mv": "0.500000",
+  "press_fs_psi": "2000",
+  "press_div": "1.0",
+  "press_pga": "\u00b14.096 V",
+  "press_limit": "1000",
+  "data_dir": "/home/dyno/dyno_runs",
+  "run_prefix": "dyno_run",
+  "autosave": true,
+  "pid_hold": {
+    "kp": "0.28",
+    "ki": ".45",
+    "kd": "0.01"
+  },
+  "pid_sweep": {
+    "kp": "0.21",
+    "ki": ".35",
+    "kd": "0.007"
+  },
+  "run": {
+    "hold_rpm": "2000",
+    "start_rpm": "2250",
+    "end_rpm": "3500",
+    "rate": "300"
+  },
+  "units": "lb-ft",
+  "gain_span": 667.0,
+  "cam_table": [
+    [
+      "",
+      ""
+    ],
+    [
+      "",
+      ""
+    ],
+    [
+      "",
+      ""
+    ],
+    [
+      "",
+      ""
+    ],
+    [
+      "",
+      ""
+    ],
+    [
+      "",
+      ""
+    ],
+    [
+      "",
+      ""
+    ],
+    [
+      "",
+      ""
+    ]
+  ],
+  "analysis": {
+    "filter": "YourDyno Binned (J1349)",
+    "rpm_bin": "100",
+    "rpm_min": "1500",
+    "rpm_max": "0",
+    "despike": true,
+    "show_raw": true,
+    "sae_apply": false,
+    "param_alpha": "0.20",
+    "param_window": "20",
+    "param_polyorder": "3",
+    "param_tau": "50",
+    "param_degree": "2",
+    "yd_gauge": "3",
+    "yd_graph": "3",
+    "yd_spike": "0",
+    "sae_temp": "77.0",
+    "sae_hum": "50.0",
+    "sae_press": "29.92"
+  },
+  "load_cell_cal": {
+    "zero_mv": "",
+    "load_mv": "",
+    "known_wt": "",
+    "wt_units": "lb"
+  },
+  "pressure_points": {
+    "mv1": "",
+    "psi1": "0",
+    "mv2": "",
+    "psi2": ""
+  },
+  "live_smoothing": {
+    "on": true,
+    "alpha": "0.30"
+  },
+  "traces_shown": {
+    "rpm": true,
+    "torque": true,
+    "hp": true,
+    "psi": true,
+    "brake": true
+  },
+  "replay": {
+    "speed": "1.0",
+    "drive_motor": true,
+    "travel_pct": "40"
+  }
+}
