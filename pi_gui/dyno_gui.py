@@ -157,7 +157,7 @@ PRESSURE_DEFAULT_FS_PSI = 2000.0
 # Interface version. Recorded beside every run together with the firmware
 # version the board reported, so a result can always be traced back to the
 # code that produced it.
-UI_VERSION = "1.13.0"
+UI_VERSION = "1.14.0"
 
 # Shipped alongside the code. PNG rather than the original JPEG because Tk
 # reads PNG natively - loading a JPEG would mean depending on Pillow at

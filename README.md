@@ -6,7 +6,7 @@ a stepper-actuated hydraulic brake.
 
 | Component | Version | Location |
 |---|---|---|
-| Raspberry Pi UI | 1.13.0 | [`pi_gui/`](pi_gui/) |
+| Raspberry Pi UI | 1.14.0 | [`pi_gui/`](pi_gui/) |
 | ESP32-S3 firmware | 1.7.0 | [`esp32_firmware/`](esp32_firmware/) |
 
 Both versions are recorded in the `_conditions.json` file saved beside every
@@ -110,6 +110,33 @@ serial port to be disconnected and a deliberate confirmation, because it reboots
 the controller holding the brake. `esp32_firmware/build/firmware.bin` is the
 binary it fetches; rebuild and commit it alongside `main.cpp` so the two never
 disagree.
+
+## Analysing runs
+
+`pi_gui/dyno_analyze.py` reads runs, sweeps and pulse captures and says what is
+wrong with them. It imports nothing from the GUI, so it runs anywhere the data
+does.
+
+```sh
+python dyno_analyze.py                  # the default run folder
+python dyno_analyze.py <file-or-folder> # a specific run
+python dyno_analyze.py --github         # fetch data/ from here and analyse it
+python dyno_analyze.py --plot           # also write a PNG per file
+```
+
+Every check exists because it caught something real. It separates the cases
+that look alike in a summary:
+
+| It sees | It concludes |
+|---|---|
+| every measured channel a constant zero | nothing was connected; not a run at all |
+| position a **constant ratio** of the command | the controller was working to a smaller target - the interface and the firmware disagree about the brake range |
+| that ratio **degrading** as load builds | the motor is losing steps |
+| pressure collapsing while position still rises | the hydraulic let go, not sensor noise |
+| `Kp` against the brake range it drives | the error it takes to reach full brake |
+
+It will not recommend a brake range from a sweep that did not finish - a
+truncated curve puts "saturation" wherever the actuator happened to stop.
 
 ## Publishing runs
 
